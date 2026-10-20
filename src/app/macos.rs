@@ -55,6 +55,11 @@ pub fn tag_layers_srgb(window: &Window) {
 /// redraw; it returns early when the buttons are already in place.
 pub fn inset_traffic_lights(window: &Window, x: f64, bar_h: f64) {
     let Some(win) = ns_window(window) else { return };
+    // In fullscreen AppKit hosts the buttons in its own reveal-on-hover titlebar; moving them
+    // there pushes them out of it as soon as they appear.
+    if win.styleMask().contains(objc2_app_kit::NSWindowStyleMask::FullScreen) {
+        return;
+    }
     let (Some(close), Some(mini), Some(zoom)) = (
         win.standardWindowButton(NSWindowButton::CloseButton),
         win.standardWindowButton(NSWindowButton::MiniaturizeButton),
