@@ -308,8 +308,10 @@ impl Session {
         if let Some(c) = cam {
             c.stop();
         }
-        let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
-        if o.mic_backend == MicBackend::Avcapture
+        // Before macOS 15 ScreenCaptureKit has no microphone, so use AVCapture.
+        let mic_backend = if crate::screen::sck_15_features() { o.mic_backend } else { MicBackend::Avcapture };
+        let sck_mic = if mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
+        if mic_backend == MicBackend::Avcapture
             && let Some(sel) = &o.mic
         {
             self.av_mic = Some(Mic::start(sel.as_deref(), self.shared.clone())?);
