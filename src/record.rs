@@ -90,6 +90,9 @@ pub struct Options {
     pub mic_warning: Option<String>,
     pub webcam: Option<Option<String>>,
     pub pip: PipSpec,
+    /// Also write the camera alone next to the output (camera scenes other
+    /// than the camera-only one).
+    pub save_camera: bool,
     pub cursor: bool,
     pub clicks: bool,
     pub duration: Option<f64>,
@@ -198,6 +201,9 @@ impl Session {
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
         let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
+        if write && o.save_camera && o.scene != Scene::Cam {
+            sink.save_camera(crate::writer::camera_path(&o.output));
+        }
         if capture_size(o) != (w, h)
             && let Some(sc) = crate::scale::FrameScaler::new(w, h)
         {

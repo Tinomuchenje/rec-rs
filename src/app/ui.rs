@@ -203,7 +203,7 @@ fn preview(ui: &mut Ui, st: &mut State) {
             // Around the picture, not over its edges.
             ui.painter().rect_stroke(rect, r, Stroke::new(2.0, border), egui::StrokeKind::Outside);
         }
-        if live && st.settings.scene == Scene::ScreenCam {
+        if live && st.settings.scene.has_overlay() {
             drag_overlay(ui, st, rect);
         }
     });
@@ -225,26 +225,153 @@ fn overlay_ui_rect(st: &State, spec: &compose::PipSpec, preview: egui::Rect) -> 
     )
 }
 
-/// Drag the camera overlay in the preview. It moves live (in the preview
-/// and the recording) and snaps to a corner when released near one.
+/// The overlay edges a drag moves; none means it moves the whole overlay.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Edges {
+    l: bool,
+    r: bool,
+    t: bool,
+    b: bool,
+}
+
+impl Edges {
+    /// Edges within `grip` points of `p`.
+    fn at(ov: egui::Rect, p: egui::Pos2, grip: f32) -> Edges {
+        Edges {
+            l: (p.x - ov.left()).abs() <= grip,
+            r: (p.x - ov.right()).abs() <= grip,
+            t: (p.y - ov.top()).abs() <= grip,
+            b: (p.y - ov.bottom()).abs() <= grip,
+        }
+    }
+
+    fn cursor(self) -> egui::CursorIcon {
+        use egui::CursorIcon as C;
+        match (self.l || self.r, self.t || self.b) {
+            (true, true) if self.l == self.t => C::ResizeNwSe,
+            (true, true) => C::ResizeNeSw,
+            (true, false) => C::ResizeHorizontal,
+            (false, true) => C::ResizeVertical,
+            _ => C::Default,
+        }
+    }
+}
+
+/// Move the dragged edges of the overlay by `d`, keeping the others in
+/// place. Width and height change independently, for every shape.
+fn resize_overlay(st: &mut State, preview: egui::Rect, ov: egui::Rect, e: Edges, d: egui::Vec2) {
+    let (pw, ph) = (preview.width(), preview.height());
+    let w = (ov.width() + if e.l { -d.x } else if e.r { d.x } else { 0.0 }).clamp(0.05 * pw, 0.9 * pw);
+    let h = (ov.height() + if e.t { -d.y } else if e.b { d.y } else { 0.0 }).clamp(0.05 * ph, ph);
+    // Keep the edges opposite the dragged ones where they are.
+    let x0 = if e.l { ov.right() - w } else { ov.left() };
+    let y0 = if e.t { ov.bottom() - h } else { ov.top() };
+    let c = egui::Rect::from_min_size(egui::pos2(x0, y0), vec2(w, h)).center();
+    let s = &mut st.settings;
+    s.pip_size = (w / pw) as f64;
+    s.pip_height = Some((h / ph) as f64);
+    s.pip_place = Place::At([((c.x - preview.min.x) / pw) as f64, ((c.y - preview.min.y) / ph) as f64]);
+}
+
+/// Move the camera picture inside the overlay by `d` points.
+fn pan_camera(st: &mut State, ov: egui::Rect, d: egui::Vec2) {
+    let s = &mut st.settings;
+    let (w, h) = (ov.width() as f64, ov.height() as f64);
+    let (k, _, _) = compose::cam_place(st.cam_aspect, 1.0, w, h, s.pip_zoom, s.pip_pan);
+    // How far the picture overflows the overlay each way, in points.
+    let (ex, ey) = (st.cam_aspect * k - w, k - h);
+    if ex > 0.5 {
+        s.pip_pan[0] = (s.pip_pan[0] - d.x as f64 / ex).clamp(0.0, 1.0);
+    }
+    if ey > 0.5 {
+        s.pip_pan[1] = (s.pip_pan[1] - d.y as f64 / ey).clamp(0.0, 1.0);
+    }
+}
+
+/// What a drag on the overlay does.
+#[derive(Clone, Copy, PartialEq)]
+enum DragMode {
+    Move,
+    Resize(Edges),
+    /// Option-drag inside the overlay: reframe the camera picture.
+    Pan,
+}
+
+impl DragMode {
+    fn at(ov: egui::Rect, p: egui::Pos2, grip: f32, alt: bool) -> DragMode {
+        let e = Edges::at(ov, p, grip);
+        if e != Edges::default() {
+            DragMode::Resize(e)
+        } else if alt {
+            DragMode::Pan
+        } else {
+            DragMode::Move
+        }
+    }
+}
+
+/// Drag the camera overlay in the preview to move it, drag its edges and
+/// corners to resize it, Option-drag inside it to reframe the camera, and
+/// scroll or pinch over it to zoom. Changes apply live (in the preview and
+/// the recording), and it snaps to a corner when released near one.
 fn drag_overlay(ui: &mut Ui, st: &mut State, preview: egui::Rect) {
     const SNAP: f64 = 0.05;
+    // Resize handles reach this far either side of an edge, in points.
+    const GRIP: f32 = 6.0;
     let spec = st.settings.pip_spec();
     let ov = overlay_ui_rect(st, &spec, preview);
-    let resp = ui.interact(ov, ui.id().with("pip-drag"), Sense::drag());
+    let id = ui.id().with("pip-drag");
+    let resp = ui.interact(ov.expand(GRIP), id, Sense::drag());
+    let alt = ui.input(|i| i.modifiers.alt);
+    if resp.drag_started()
+        && let Some(p) = ui.input(|i| i.pointer.press_origin())
+    {
+        ui.data_mut(|d| d.insert_temp(id, DragMode::at(ov, p, GRIP, alt)));
+    }
+    let mode = if resp.dragged() || resp.drag_stopped() {
+        ui.data(|d| d.get_temp::<DragMode>(id)).unwrap_or(DragMode::Move)
+    } else {
+        resp.hover_pos().map(|p| DragMode::at(ov, p, GRIP, alt)).unwrap_or(DragMode::Move)
+    };
     let accent = theme::accent();
     if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        ui.ctx().set_cursor_icon(match mode {
+            DragMode::Resize(e) => e.cursor(),
+            DragMode::Pan => egui::CursorIcon::Move,
+            DragMode::Move if resp.dragged() => egui::CursorIcon::Grabbing,
+            DragMode::Move => egui::CursorIcon::Grab,
+        });
         ui.painter().rect_stroke(ov, CornerRadius::same(4), Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+        // Corner handles show the overlay can be resized.
+        for c in [ov.left_top(), ov.right_top(), ov.left_bottom(), ov.right_bottom()] {
+            ui.painter().circle(c, 4.0, Color32::WHITE, Stroke::new(1.5, accent));
+        }
+    }
+    if resp.hovered() && !resp.dragged() {
+        let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let zoom = (st.settings.pip_zoom * pinch as f64 * (scroll as f64 * 0.005).exp()).clamp(1.0, 4.0);
+        if zoom != st.settings.pip_zoom {
+            st.settings.pip_zoom = zoom;
+            st.apply_pip();
+            let _ = st.settings.save();
+        }
     }
     if resp.dragged() {
         let d = resp.drag_delta();
-        let (cx, cy) = ((ov.center().x - preview.min.x) / preview.width(), (ov.center().y - preview.min.y) / preview.height());
-        let at = [(cx + d.x / preview.width()).clamp(0.0, 1.0) as f64, (cy + d.y / preview.height()).clamp(0.0, 1.0) as f64];
-        st.settings.pip_place = Place::At(at);
+        match mode {
+            DragMode::Move => {
+                let (cx, cy) = ((ov.center().x - preview.min.x) / preview.width(), (ov.center().y - preview.min.y) / preview.height());
+                let at = [(cx + d.x / preview.width()).clamp(0.0, 1.0) as f64, (cy + d.y / preview.height()).clamp(0.0, 1.0) as f64];
+                st.settings.pip_place = Place::At(at);
+            }
+            DragMode::Resize(e) => resize_overlay(st, preview, ov, e, d),
+            DragMode::Pan => pan_camera(st, ov, d),
+        }
         // Show where it would snap.
         let (w, h) = frame_size(st);
-        if let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP) {
+        if mode != DragMode::Pan
+            && let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP)
+        {
             let ghost = overlay_ui_rect(st, &compose::PipSpec { place: Place::Corner(c), ..st.settings.pip_spec() }, preview);
             ui.painter().rect_stroke(ghost, CornerRadius::same(4), Stroke::new(1.0, accent.gamma_multiply(0.7)), egui::StrokeKind::Outside);
         }
@@ -252,7 +379,9 @@ fn drag_overlay(ui: &mut Ui, st: &mut State, preview: egui::Rect) {
     }
     if resp.drag_stopped() {
         let (w, h) = frame_size(st);
-        if let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP) {
+        if mode != DragMode::Pan
+            && let Some(c) = compose::snap_corner(&st.settings.pip_spec(), w, h, st.cam_aspect, SNAP)
+        {
             st.settings.pip_place = Place::Corner(c);
         }
         st.apply_pip();
@@ -295,8 +424,17 @@ fn shape_icon(ui: &Ui, rect: egui::Rect, shape: Shape, roundness: f64, color: Co
     }
 }
 
+/// The overlay height (fraction of the frame height) while it is automatic:
+/// as wide as it is tall for square shapes, else the camera's shape.
+fn auto_height(st: &State, s: &Settings) -> f64 {
+    let aspect = if s.pip_shape.is_square() { 1.0 } else { st.cam_aspect.max(0.1) };
+    s.pip_size * st.preview_aspect as f64 / aspect
+}
+
 /// Camera overlay look and position. Live: also while recording.
-fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
+/// `auto_height` is the height (fraction of the frame) shown while the
+/// height is automatic.
+fn overlay_controls(ui: &mut Ui, s: &mut Settings, auto_height: f64) {
     let p = theme::pal(ui);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -322,10 +460,35 @@ fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
         });
     };
     ui.spacing_mut().slider_width = slider_w;
-    row(ui, "Size", &mut |ui| {
+    row(ui, "Width", &mut |ui| {
         let mut pct = s.pip_size * 100.0;
-        if ui.add(egui::Slider::new(&mut pct, 10.0..=50.0).suffix(" %").integer()).changed() {
+        if ui.add(egui::Slider::new(&mut pct, 5.0..=90.0).suffix(" %").integer()).changed() {
             s.pip_size = pct / 100.0;
+        }
+    });
+    row(ui, "Height", &mut |ui| {
+        // Narrower slider: the Auto button shares the row.
+        ui.spacing_mut().slider_width = slider_w - 40.0;
+        let mut pct = s.pip_height.unwrap_or(auto_height.min(1.0)) * 100.0;
+        if ui.add(egui::Slider::new(&mut pct, 5.0..=100.0).suffix(" %").integer()).changed() {
+            s.pip_height = Some(pct / 100.0);
+        }
+        let auto = s.pip_height.is_none();
+        let tip = if s.pip_shape.is_square() { "Keep it as tall as it is wide" } else { "Follow the camera's shape" };
+        if ui.add(egui::Button::selectable(auto, "Auto")).on_hover_text(tip).clicked() {
+            s.pip_height = None;
+        }
+    });
+    row(ui, "Zoom", &mut |ui| {
+        // Narrower slider: the Center button shares the row.
+        ui.spacing_mut().slider_width = slider_w - 50.0;
+        let mut pct = s.pip_zoom * 100.0;
+        if ui.add(egui::Slider::new(&mut pct, 100.0..=400.0).suffix(" %").integer()).changed() {
+            s.pip_zoom = pct / 100.0;
+        }
+        let centred = s.pip_pan == [0.5, 0.5];
+        if ui.add_enabled(!centred, egui::Button::new("Center")).on_hover_text("Center the camera in the overlay").clicked() {
+            s.pip_pan = [0.5, 0.5];
         }
     });
     row(ui, "Roundness", &mut |ui| {
@@ -364,7 +527,43 @@ fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
         ui.checkbox(&mut s.pip_shadow, "Shadow");
         ui.checkbox(&mut s.mirror, "Mirror");
     });
-    ui.label(RichText::new("Drag the camera in the preview to move it; it snaps to corners.").size(SECONDARY).color(p.secondary));
+    ui.label(
+        RichText::new(
+            "In the preview: drag the camera to move it (it snaps to corners), drag its edges to resize it, \
+             scroll over it to zoom, and Option-drag inside it to reframe.",
+        )
+            .size(SECONDARY)
+            .color(p.secondary),
+    );
+}
+
+/// Presenter background: a color, or an image covering the frame.
+fn background_controls(ui: &mut Ui, s: &mut Settings) {
+    let p = theme::pal(ui);
+    ui.horizontal(|ui| {
+        ui.add_sized(vec2(64.0, 18.0), egui::Label::new(RichText::new("Color").size(SECONDARY).color(p.secondary)));
+        ui.spacing_mut().interact_size = vec2(36.0, 20.0);
+        ui.color_edit_button_srgb(&mut s.bg_color);
+        if ui.button("Image…").on_hover_text("Use a picture instead of the color").clicked()
+            && let Some(f) = rfd::FileDialog::new()
+                .add_filter("Images", &["jpg", "jpeg", "png", "heic", "tif", "tiff", "webp", "gif", "bmp"])
+                .pick_file()
+        {
+            s.bg_image = Some(f);
+        }
+        if s.bg_image.is_some() && ui.button("Remove").on_hover_text("Go back to the color").clicked() {
+            s.bg_image = None;
+        }
+    });
+    if let Some(f) = &s.bg_image {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        ui.add(egui::Label::new(RichText::new(name).size(SECONDARY).color(p.secondary)).truncate()).on_hover_text(tilde(f));
+    }
+    ui.label(
+        RichText::new("Your screen sits in a frame beside the camera. Drag the camera to the other side and the screen follows.")
+            .size(SECONDARY)
+            .color(p.secondary),
+    );
 }
 
 fn controls(ui: &mut Ui, st: &mut State) {
@@ -496,29 +695,38 @@ fn sources(ui: &mut Ui, st: &mut State) {
     let mut s = st.settings.clone();
 
     section(ui, "SCENE");
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let w = (ui.available_width() - 8.0) / 3.0;
-        for scene in Scene::ALL {
-            // While recording, only scenes the running session supports.
-            let ok = idle || st.can_switch_live(scene);
-            let label = match scene {
-                Scene::Screen => "Screen",
-                Scene::ScreenCam => "Screen + Cam",
-                Scene::Cam => "Camera",
-            };
-            let sel = s.scene == scene;
-            let b = egui::Button::selectable(sel, RichText::new(label).size(SECONDARY + 1.0)).min_size(vec2(w, 26.0));
-            let resp = ui.add_enabled(ok, b);
-            let resp = if ok { resp } else { resp.on_disabled_hover_text("Start the recording with a camera scene to switch live") };
-            if resp.clicked() && !sel {
-                s.scene = scene;
-                if let Some(r) = &st.recording {
-                    r.set_scene(scene);
+    // Two rows of two: four labels do not fit across the sidebar.
+    for pair in Scene::ALL.chunks(2) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = (ui.available_width() - 4.0) / 2.0;
+            for &scene in pair {
+                // While recording, only scenes the running session supports.
+                let ok = idle || st.can_switch_live(scene);
+                let label = match scene {
+                    Scene::Screen => "Screen",
+                    Scene::ScreenCam => "Screen + Cam",
+                    Scene::Presenter => "Presenter",
+                    Scene::Cam => "Camera",
+                };
+                let sel = s.scene == scene;
+                let b = egui::Button::selectable(sel, RichText::new(label).size(SECONDARY + 1.0)).min_size(vec2(w, 26.0));
+                let resp = ui.add_enabled(ok, b);
+                let resp = if ok { resp } else { resp.on_disabled_hover_text("Start the recording with a camera scene to switch live") };
+                let resp = if scene == Scene::Presenter {
+                    resp.on_hover_text("Your screen in a frame on a background, with the camera beside it")
+                } else {
+                    resp
+                };
+                if resp.clicked() && !sel {
+                    s.scene = scene;
+                    if let Some(r) = &st.recording {
+                        r.set_scene(scene);
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     section(ui, "SCREEN");
     let displays: Vec<(usize, String)> = st.displays.iter().enumerate().map(|(i, d)| (i + 1, d.clone())).collect();
@@ -543,9 +751,21 @@ fn sources(ui: &mut Ui, st: &mut State) {
     if !s.scene.uses_cam() {
         ui.label(RichText::new("Pick a camera scene to use the webcam.").size(SECONDARY).color(theme::pal(ui).secondary));
     }
-    if s.scene == Scene::ScreenCam {
+    if s.scene.has_overlay() {
+        ui.add_enabled(idle, egui::Checkbox::new(&mut s.save_camera, "Also save the camera on its own")).on_hover_text(
+            "Writes NAME-camera next to the recording: the full camera picture with your mic, \
+             in step with the recording frame for frame. Stack both in your editor to cut \
+             between screen and talking head.",
+        );
+    }
+    if s.scene.has_overlay() {
         section(ui, "CAMERA OVERLAY");
-        overlay_controls(ui, &mut s);
+        let auto_h = auto_height(st, &s);
+        overlay_controls(ui, &mut s, auto_h);
+    }
+    if s.scene == Scene::Presenter {
+        section(ui, "BACKGROUND");
+        background_controls(ui, &mut s);
     }
 
     section(ui, "AUDIO");
@@ -683,7 +903,8 @@ pub fn settings_window(ui: &mut Ui, st: &mut State) {
                 // The overlay stays editable while recording (applied live).
                 section(ui, "CAMERA OVERLAY");
                 let mut s = st.settings.clone();
-                overlay_controls(ui, &mut s);
+                let auto_h = auto_height(st, &s);
+                overlay_controls(ui, &mut s, auto_h);
                 if s != st.settings {
                     st.settings = s;
                     st.apply_pip();

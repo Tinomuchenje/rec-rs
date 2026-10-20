@@ -41,6 +41,12 @@ pub struct Settings {
     pub system_gain_db: f32,
     pub mic_gain_db: f32,
     pub pip_size: f64,
+    /// Overlay height as a fraction of the frame height; None = camera shape.
+    pub pip_height: Option<f64>,
+    /// Camera zoom inside the overlay (1 = fill it).
+    pub pip_zoom: f64,
+    /// Which part of the camera shows, 0..1 from the left and top.
+    pub pip_pan: [f64; 2],
     pub pip_place: Place,
     pub pip_shape: Shape,
     pub pip_roundness: f64,
@@ -48,6 +54,11 @@ pub struct Settings {
     pub pip_border_color: [u8; 3],
     pub pip_shadow: bool,
     pub mirror: bool,
+    /// Presenter scene background color, and an optional image over it.
+    pub bg_color: [u8; 3],
+    pub bg_image: Option<PathBuf>,
+    /// Also save the camera alone when recording a scene with the overlay.
+    pub save_camera: bool,
     pub cursor: bool,
     pub clicks: bool,
     /// Preview at half resolution and 15 fps.
@@ -96,6 +107,9 @@ impl Default for Settings {
             system_gain_db: 0.0,
             mic_gain_db: 0.0,
             pip_size: PipSpec::default().size,
+            pip_height: PipSpec::default().height,
+            pip_zoom: PipSpec::default().zoom,
+            pip_pan: PipSpec::default().pan,
             pip_place: PipSpec::default().place,
             pip_shape: PipSpec::default().shape,
             pip_roundness: PipSpec::default().roundness,
@@ -103,6 +117,9 @@ impl Default for Settings {
             pip_border_color: [255, 255, 255],
             pip_shadow: false,
             mirror: true,
+            bg_color: PipSpec::default().bg_color,
+            bg_image: None,
+            save_camera: true,
             cursor: true,
             clicks: false,
             preview_low_power: false,
@@ -180,6 +197,9 @@ impl Settings {
     pub fn pip_spec(&self) -> PipSpec {
         PipSpec {
             size: self.pip_size,
+            height: self.pip_height,
+            zoom: self.pip_zoom,
+            pan: self.pip_pan,
             place: self.pip_place,
             shape: self.pip_shape,
             roundness: self.pip_roundness,
@@ -187,6 +207,8 @@ impl Settings {
             border_color: self.pip_border_color,
             shadow: self.pip_shadow,
             mirror: self.mirror,
+            bg_color: self.bg_color,
+            bg_image: self.bg_image.clone(),
         }
     }
 
@@ -196,6 +218,9 @@ impl Settings {
         let d = Settings::default();
         Settings {
             pip_size: d.pip_size,
+            pip_height: d.pip_height,
+            pip_zoom: d.pip_zoom,
+            pip_pan: d.pip_pan,
             pip_place: d.pip_place,
             pip_shape: d.pip_shape,
             pip_roundness: d.pip_roundness,
@@ -203,6 +228,10 @@ impl Settings {
             pip_border_color: d.pip_border_color,
             pip_shadow: d.pip_shadow,
             mirror: d.mirror,
+            bg_color: d.bg_color,
+            bg_image: d.bg_image.clone(),
+            // Only read when a recording starts.
+            save_camera: d.save_camera,
             preview_low_power: d.preview_low_power,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
@@ -300,6 +329,12 @@ impl Settings {
         a.extend(["--system-gain".into(), format!("{}", self.system_gain_db)]);
         a.extend(["--mic-gain".into(), format!("{}", self.mic_gain_db)]);
         a.extend(["--pip-size".into(), format!("{}", self.pip_size)]);
+        if let Some(h) = self.pip_height {
+            a.extend(["--pip-height".into(), format!("{h}")]);
+        }
+        a.extend(["--pip-zoom".into(), format!("{}", self.pip_zoom)]);
+        let [px, py] = self.pip_pan;
+        a.extend(["--pip-pan".into(), format!("{},{}", px.clamp(0.0, 1.0), py.clamp(0.0, 1.0))]);
         match self.pip_place {
             Place::Corner(c) => a.extend(["--pip-corner".into(), value(c)]),
             Place::At([x, y]) => a.extend(["--pip-pos".into(), format!("{},{}", x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))]),
@@ -314,6 +349,14 @@ impl Settings {
         }
         if !self.mirror {
             a.push("--no-mirror".into());
+        }
+        let [r, g, b] = self.bg_color;
+        a.extend(["--bg-color".into(), format!("{r:02x}{g:02x}{b:02x}")]);
+        if let Some(p) = &self.bg_image {
+            a.extend(["--bg-image".into(), p.to_string_lossy().into_owned()]);
+        }
+        if self.save_camera && self.scene.has_overlay() {
+            a.push("--save-camera".into());
         }
         if !self.cursor {
             a.push("--no-cursor".into());

@@ -156,6 +156,17 @@ pub struct RecordArgs {
     /// Webcam overlay width as a fraction of the frame width.
     #[arg(long, default_value_t = 0.22)]
     pip_size: f64,
+    /// Webcam overlay height as a fraction of the frame height. Default:
+    /// the camera's aspect ratio, or square for circle, square and squircle.
+    #[arg(long)]
+    pip_height: Option<f64>,
+    /// Zoom the camera inside the overlay, 1 (fill it) to 4.
+    #[arg(long, default_value_t = 1.0)]
+    pip_zoom: f64,
+    /// Which part of the camera shows when zoomed or cropped: X,Y from 0
+    /// (left, top) to 1 (right, bottom), as seen.
+    #[arg(long, value_name = "X,Y", default_value = "0.5,0.5")]
+    pip_pan: String,
     /// Snap the webcam overlay to a corner.
     #[arg(long, value_enum, default_value_t = Corner::BottomRight)]
     pip_corner: Corner,
@@ -180,6 +191,18 @@ pub struct RecordArgs {
     /// Do not mirror the webcam.
     #[arg(long)]
     no_mirror: bool,
+    /// Presenter scene background color as hex RGB.
+    #[arg(long, default_value = "1e3a5f", value_name = "RRGGBB")]
+    bg_color: String,
+    /// Presenter scene background image (JPEG, PNG, HEIC...), covering the
+    /// frame over the background color.
+    #[arg(long, value_name = "FILE")]
+    bg_image: Option<std::path::PathBuf>,
+    /// Also save the camera on its own, full frame with the mic, as
+    /// NAME-camera.EXT next to the recording and in step with it frame for
+    /// frame (camera scenes other than --scene cam).
+    #[arg(long)]
+    save_camera: bool,
     /// Hide the mouse cursor.
     #[arg(long)]
     no_cursor: bool,
@@ -405,6 +428,9 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         webcam,
         pip: PipSpec {
             size: a.pip_size.clamp(0.05, 0.9),
+            height: a.pip_height.map(|h| h.clamp(0.05, 1.0)),
+            zoom: a.pip_zoom.clamp(1.0, 4.0),
+            pan: parse_pos(&a.pip_pan)?.map(|v| v.clamp(0.0, 1.0)),
             place: match &a.pip_pos {
                 Some(p) => compose::Place::At(parse_pos(p)?),
                 None => compose::Place::Corner(a.pip_corner),
@@ -415,7 +441,10 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
             border_color: parse_hex(&a.pip_border_color)?,
             shadow: a.pip_shadow,
             mirror: !a.no_mirror,
+            bg_color: parse_hex(&a.bg_color)?,
+            bg_image: a.bg_image.clone(),
         },
+        save_camera: a.save_camera,
         cursor: !a.no_cursor,
         clicks: a.clicks,
         duration: a.duration,
@@ -576,6 +605,14 @@ fn record(a: RecordArgs) -> Result<()> {
             stats.audio_drops,
             stats.audio_clipped_samples
         );
+        if stats.camera_file_frames > 0 {
+            eprintln!(
+                "rec: saved {} (camera alone: {} video frames, {} dropped)",
+                writer::camera_path(&out).display(),
+                stats.camera_file_frames,
+                stats.camera_file_drops
+            );
+        }
     }
     if std::env::var_os("REC_DEBUG").is_some() {
         let avg = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 * 1000.0 };

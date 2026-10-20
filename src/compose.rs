@@ -49,7 +49,7 @@ impl Shape {
         }
     }
 
-    /// Crops the camera to a centered square.
+    /// Square (crops the camera to a centered square) unless given a height.
     pub fn is_square(self) -> bool {
         matches!(self, Shape::Circle | Shape::Square | Shape::Squircle)
     }
@@ -69,19 +69,27 @@ pub enum Scene {
     /// The screen with the webcam picture-in-picture.
     #[default]
     ScreenCam,
+    /// The screen framed on a background, beside the webcam (never under it).
+    Presenter,
     /// The webcam full frame.
     Cam,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 3] = [Scene::Screen, Scene::ScreenCam, Scene::Cam];
+    pub const ALL: [Scene; 4] = [Scene::Screen, Scene::ScreenCam, Scene::Presenter, Scene::Cam];
 
     pub fn label(self) -> &'static str {
         match self {
             Scene::Screen => "Screen",
             Scene::ScreenCam => "Screen + Camera",
+            Scene::Presenter => "Presenter",
             Scene::Cam => "Camera",
         }
+    }
+
+    /// The webcam overlay is drawn (and can be dragged in the preview).
+    pub fn has_overlay(self) -> bool {
+        matches!(self, Scene::ScreenCam | Scene::Presenter)
     }
 
     pub fn uses_cam(self) -> bool {
@@ -95,6 +103,16 @@ pub fn fit(sw: f64, sh: f64, dw: f64, dh: f64, cover: bool) -> (f64, f64, f64) {
     let (a, b) = (dw / sw, dh / sh);
     let s = if cover { a.max(b) } else { a.min(b) };
     (s, (dw - sw * s) / 2.0, (dh - sh * s) / 2.0)
+}
+
+/// Scale and placement of a `sw`x`sh` camera picture in a `dw`x`dh`
+/// overlay: it fills the overlay `zoom` times closer, and `pan` picks which
+/// part of the overflow shows. Returns the scale and the picture's offset
+/// from the overlay's top-left corner (zero or negative), as seen.
+pub fn cam_place(sw: f64, sh: f64, dw: f64, dh: f64, zoom: f64, pan: [f64; 2]) -> (f64, f64, f64) {
+    let s = (dw / sw).max(dh / sh) * zoom.max(1.0);
+    let (ex, ey) = (sw * s - dw, sh * s - dh);
+    (s, -ex * pan[0].clamp(0.0, 1.0), -ey * pan[1].clamp(0.0, 1.0))
 }
 
 /// Aspect ratios this close (relative) count as the same: output sizes are
@@ -132,6 +150,14 @@ pub enum Place {
 pub struct PipSpec {
     /// Overlay width as a fraction of the output width.
     pub size: f64,
+    /// Overlay height as a fraction of the output height; None follows the
+    /// camera's aspect ratio, or the width for square shapes.
+    pub height: Option<f64>,
+    /// How much closer than filling the overlay the camera is, 1 or more.
+    pub zoom: f64,
+    /// Which part of the camera shows when it overflows the overlay: 0..1
+    /// from the left and from the top, as seen (after mirroring).
+    pub pan: [f64; 2],
     pub place: Place,
     pub shape: Shape,
     /// Corner rounding, 0 (sharp) to 1 (as round as the shape allows).
@@ -141,12 +167,22 @@ pub struct PipSpec {
     pub border_color: [u8; 3],
     pub shadow: bool,
     pub mirror: bool,
+    /// Presenter scene background color, behind the image if one is set.
+    pub bg_color: [u8; 3],
+    /// Presenter scene background image, covering the frame.
+    pub bg_image: Option<std::path::PathBuf>,
 }
+
+/// Default presenter background: a deep blue.
+pub const BG_COLOR: [u8; 3] = [0x1e, 0x3a, 0x5f];
 
 impl Default for PipSpec {
     fn default() -> Self {
         PipSpec {
             size: 0.22,
+            height: None,
+            zoom: 1.0,
+            pan: [0.5, 0.5],
             place: Place::Corner(Corner::BottomRight),
             shape: Shape::Rounded,
             roundness: 0.2,
@@ -154,6 +190,8 @@ impl Default for PipSpec {
             border_color: [255, 255, 255],
             shadow: false,
             mirror: true,
+            bg_color: BG_COLOR,
+            bg_image: None,
         }
     }
 }
@@ -165,10 +203,13 @@ pub fn margin(w: f64) -> f64 {
 
 /// Overlay size in output pixels for a `w`x`h` output.
 pub fn overlay_size(pip: &PipSpec, w: f64, h: f64, cam_aspect: f64) -> (f64, f64) {
-    let aspect = if pip.shape.is_square() { 1.0 } else { cam_aspect.max(0.1) };
     let ow = (w * pip.size).round().clamp(16.0, w);
-    let oh = (ow / aspect).round().clamp(16.0, h);
-    (ow, oh)
+    let oh = match pip.height {
+        Some(f) => h * f,
+        None if pip.shape.is_square() => ow,
+        None => ow / cam_aspect.max(0.1),
+    };
+    (ow, oh.round().clamp(16.0, h))
 }
 
 /// Overlay rectangle `[x, y, width, height]` in output pixels, measured
@@ -185,6 +226,25 @@ pub fn overlay_rect(pip: &PipSpec, w: f64, h: f64, cam_aspect: f64) -> [f64; 4] 
         Place::At([cx, cy]) => ((cx * w - ow / 2.0).round(), (cy * h - oh / 2.0).round()),
     };
     [x.clamp(0.0, w - ow), y.clamp(0.0, h - oh), ow, oh]
+}
+
+/// Where the screen goes in the presenter scene, `[x, y, width, height]`
+/// from the top-left: as large as fits beside the camera overlay, on the
+/// side away from it, in the screen's own shape.
+pub fn presenter_screen_rect(pip: &PipSpec, w: f64, h: f64, cam_aspect: f64, screen_aspect: f64) -> [f64; 4] {
+    let m = margin(w);
+    let [ox, _, ow, _] = overlay_rect(pip, w, h, cam_aspect);
+    // The screen always keeps at least a fifth of the width.
+    let (left, right) = if ox + ow / 2.0 < w / 2.0 {
+        ((ox + ow + m).min(w * 0.8 - m), w - m)
+    } else {
+        (m, (ox - m).max(w * 0.2 + m))
+    };
+    let (aw, ah) = (right - left, h - 2.0 * m);
+    let a = screen_aspect.max(0.1);
+    let (sw, sh) = if aw / ah > a { (ah * a, ah) } else { (aw, aw / a) };
+    let (sw, sh) = (sw.round(), sh.round());
+    [(left + (aw - sw) / 2.0).round(), ((h - sh) / 2.0).round(), sw, sh]
 }
 
 /// The corner whose snapped position is within `radius` (a fraction of
@@ -422,6 +482,10 @@ pub struct Compositor {
     h: f64,
     pip: PipSpec,
     decor: Option<Decor>,
+    /// The presenter scene's screen frame (rounded corners and shadow).
+    frame: Option<Decor>,
+    /// The presenter background for a color and image, rendered once.
+    bg: Option<(([u8; 3], Option<std::path::PathBuf>), Retained<CIImage>)>,
     /// Aspect ratio of the last camera frame (16:9 until one arrives).
     cam_aspect: f64,
 }
@@ -440,7 +504,7 @@ impl Compositor {
             let opts = dict(vec![(&*ns("kCIContextCacheIntermediates"), num_b(false))]);
             let ctx = CIContext::contextWithOptions(Some(&opts));
             let cs = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)).expect("sRGB colorspace");
-            Compositor { ctx, cs, w: width as f64, h: height as f64, pip, decor: None, cam_aspect: 16.0 / 9.0 }
+            Compositor { ctx, cs, w: width as f64, h: height as f64, pip, decor: None, frame: None, bg: None, cam_aspect: 16.0 / 9.0 }
         }
     }
 
@@ -453,12 +517,123 @@ impl Compositor {
         self.cam_aspect
     }
 
+    pub fn mirrors(&self) -> bool {
+        self.pip.mirror
+    }
+
     fn decor(&mut self, w: usize, h: usize) -> &Decor {
         let key = Decor::key(&self.pip, w, h, self.h);
         if self.decor.as_ref().is_none_or(|d| d.key != key) {
             self.decor = Some(Decor::build(&self.pip, w, h, self.h));
         }
         self.decor.as_ref().unwrap()
+    }
+
+    /// The presenter scene's frame for a `w`x`h` screen: corners rounded by
+    /// 2.5% of the output height, and a soft shadow.
+    fn frame_decor(&mut self, w: usize, h: usize) -> &Decor {
+        let radius = (self.h * 0.025).round();
+        let roundness = radius / (w.min(h).max(1) as f64 / 2.0);
+        let spec = PipSpec { shape: Shape::Rounded, roundness, border: 0.0, shadow: true, ..Default::default() };
+        let key = Decor::key(&spec, w, h, self.h);
+        if self.frame.as_ref().is_none_or(|d| d.key != key) {
+            self.frame = Some(Decor::build(&spec, w, h, self.h));
+        }
+        self.frame.as_ref().unwrap()
+    }
+
+    /// The presenter background: its color, under its image (scaled to
+    /// cover the frame) if one is set and readable. Rendered once per
+    /// change, so a large photo is not decoded every frame.
+    fn background(&mut self, canvas: CGRect) -> Retained<CIImage> {
+        let key = (self.pip.bg_color, self.pip.bg_image.clone());
+        if self.bg.as_ref().is_none_or(|(k, _)| *k != key) {
+            let img = self.build_background(canvas);
+            self.bg = Some((key, img));
+        }
+        self.bg.as_ref().unwrap().1.clone()
+    }
+
+    fn build_background(&self, canvas: CGRect) -> Retained<CIImage> {
+        unsafe {
+            let [r, g, b] = self.pip.bg_color.map(|c| c as f64 / 255.0);
+            let color = CIColor::colorWithRed_green_blue_colorSpace(r, g, b, &self.cs)
+                .unwrap_or_else(|| CIColor::colorWithRed_green_blue(r, g, b));
+            let img = CIImage::imageWithColor(&color).imageByCroppingToRect(canvas);
+            let Some(path) = &self.pip.bg_image else { return img };
+            let url = objc2_foundation::NSURL::fileURLWithPath(&ns(&path.to_string_lossy()));
+            let opts = dict(vec![(objc2_core_image::kCIImageApplyOrientationProperty, num_b(true))]);
+            let Some(pic) = CIImage::imageWithContentsOfURL_options(&url, Some(&opts)) else {
+                eprintln!("rec: background image unreadable: {}", path.display());
+                return img;
+            };
+            let e = pic.extent();
+            let (s, tx, ty) = fit(e.size.width, e.size.height, self.w, self.h, true);
+            let t = CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx: tx - s * e.origin.x, ty: ty - s * e.origin.y };
+            let img = pic.imageByApplyingTransform(t).imageByCompositingOverImage(&img).imageByCroppingToRect(canvas);
+            match self.ctx.createCGImage_fromRect(&img, canvas) {
+                Some(cg) => CIImage::imageWithCGImage(&cg),
+                None => img,
+            }
+        }
+    }
+
+    /// The screen scaled down into its presenter frame, with rounded
+    /// corners and a shadow, over `img`.
+    fn framed_screen(&mut self, mut img: Retained<CIImage>, sc: &CIImage) -> Retained<CIImage> {
+        unsafe {
+            let se = sc.extent();
+            let aspect = se.size.width / se.size.height.max(1.0);
+            let [x, top, sw, sh] = presenter_screen_rect(&self.pip, self.w, self.h, self.cam_aspect, aspect);
+            // CoreImage's origin is bottom-left.
+            let y = self.h - top - sh;
+            let (s, ox, oy) = fit(se.size.width, se.size.height, sw, sh, false);
+            // Lanczos keeps small text sharp as the screen is scaled down;
+            // clamping first keeps its edges from fading to transparent.
+            let params = dict(vec![(&*ns("inputScale"), num_f(s)), (&*ns("inputAspectRatio"), num_f(1.0))]);
+            let scaled = sc.imageByClampingToExtent().imageByApplyingFilter_withInputParameters(&ns("CILanczosScaleTransform"), &params);
+            let placed = translate(&scaled, x + ox - s * se.origin.x, y + oy - s * se.origin.y).imageByCroppingToRect(rect(x, y, sw, sh));
+            let drop = (self.h * 0.006).round();
+            let frame = self.frame_decor(sw as usize, sh as usize);
+            if let Some((shadow, pad)) = &frame.shadow {
+                img = translate(shadow, x - pad, y - pad - drop).imageByCompositingOverImage(&img);
+            }
+            let params = dict(vec![(&*ns("inputBackgroundImage"), obj(&*translate(&frame.mask, x, y)))]);
+            placed.imageByApplyingFilter_withInputParameters(&ns("CISourceInCompositing"), &params).imageByCompositingOverImage(&img)
+        }
+    }
+
+    /// The webcam overlay over `img`.
+    fn overlay_cam(&mut self, mut img: Retained<CIImage>, c: &CIImage) -> Retained<CIImage> {
+        unsafe {
+            let [x, top, tw, th] = overlay_rect(&self.pip, self.w, self.h, self.cam_aspect);
+            // CoreImage's origin is bottom-left.
+            let y = self.h - top - th;
+            let e = c.extent();
+            // Crop the camera to the overlay's aspect ratio, zoomed and
+            // panned. The picture's offset from the overlay's top-left as
+            // seen becomes CoreImage's bottom-left origin, flipped if
+            // mirrored.
+            let (s, off_x, off_y) = cam_place(e.size.width, e.size.height, tw, th, self.pip.zoom, self.pip.pan);
+            let (cw, ch) = (e.size.width * s, e.size.height * s);
+            let (a, tx) = if self.pip.mirror { (-s, x + off_x + cw) } else { (s, x + off_x) };
+            let ty = y + th - off_y - ch;
+            let t = CGAffineTransform { a, b: 0.0, c: 0.0, d: s, tx: tx - a * e.origin.x, ty: ty - s * e.origin.y };
+            let target = rect(x, y, tw, th);
+            let placed = c.imageByApplyingTransform(t).imageByCroppingToRect(target);
+            // Drop the shadow slightly below the overlay.
+            let drop = (self.h * 0.006).round();
+            let decor = self.decor(tw as usize, th as usize);
+            if let Some((sh, pad)) = &decor.shadow {
+                img = translate(sh, x - pad, y - pad - drop).imageByCompositingOverImage(&img);
+            }
+            if let Some(b) = &decor.border {
+                img = translate(b, x, y).imageByCompositingOverImage(&img);
+            }
+            let params = dict(vec![(&*ns("inputBackgroundImage"), obj(&*translate(&decor.mask, x, y)))]);
+            let overlay = placed.imageByApplyingFilter_withInputParameters(&ns("CISourceInCompositing"), &params);
+            overlay.imageByCompositingOverImage(&img)
+        }
     }
 
     pub fn render(&mut self, scene: Scene, screen: Option<&CVPixelBuffer>, cam: Option<&CVPixelBuffer>, out: &CVPixelBuffer) {
@@ -484,38 +659,21 @@ impl Compositor {
                 self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, out, canvas, Some(&self.cs));
                 return;
             }
-            let mut img = black;
+            let mut img = if scene == Scene::Presenter { self.background(canvas) } else { black };
             if let Some(screen) = screen {
                 let sc = CIImage::imageWithCVPixelBuffer(screen);
-                let se = sc.extent();
-                // Fit the screen into the canvas (a no-op normally: the
-                // sink scales native-size captures to the output size).
-                let (sx, sy, tx, ty) = fill(se.size.width, se.size.height, self.w, self.h);
-                img = sc.imageByApplyingTransform(CGAffineTransform { a: sx, b: 0.0, c: 0.0, d: sy, tx, ty }).imageByCompositingOverImage(&img);
+                if scene == Scene::Presenter {
+                    img = self.framed_screen(img, &sc);
+                } else {
+                    let se = sc.extent();
+                    // Fit the screen into the canvas (a no-op normally: the
+                    // sink scales native-size captures to the output size).
+                    let (sx, sy, tx, ty) = fill(se.size.width, se.size.height, self.w, self.h);
+                    img = sc.imageByApplyingTransform(CGAffineTransform { a: sx, b: 0.0, c: 0.0, d: sy, tx, ty }).imageByCompositingOverImage(&img);
+                }
             }
-            if scene == Scene::ScreenCam && let Some(c) = cam {
-                let [x, top, tw, th] = overlay_rect(&self.pip, self.w, self.h, self.cam_aspect);
-                // CoreImage's origin is bottom-left.
-                let y = self.h - top - th;
-                let e = c.extent();
-                // Crop the camera to the overlay's aspect ratio, centered.
-                let (s, ox, oy) = fit(e.size.width, e.size.height, tw, th, true);
-                let (a, tx) = if self.pip.mirror { (-s, x + tw - ox) } else { (s, x + ox) };
-                let t = CGAffineTransform { a, b: 0.0, c: 0.0, d: s, tx: tx - a * e.origin.x, ty: y + oy - s * e.origin.y };
-                let target = rect(x, y, tw, th);
-                let placed = c.imageByApplyingTransform(t).imageByCroppingToRect(target);
-                // Drop the shadow slightly below the overlay.
-                let drop = (self.h * 0.006).round();
-                let decor = self.decor(tw as usize, th as usize);
-                if let Some((sh, pad)) = &decor.shadow {
-                    img = translate(sh, x - pad, y - pad - drop).imageByCompositingOverImage(&img);
-                }
-                if let Some(b) = &decor.border {
-                    img = translate(b, x, y).imageByCompositingOverImage(&img);
-                }
-                let params = dict(vec![(&*ns("inputBackgroundImage"), obj(&*translate(&decor.mask, x, y)))]);
-                let overlay = placed.imageByApplyingFilter_withInputParameters(&ns("CISourceInCompositing"), &params);
-                img = overlay.imageByCompositingOverImage(&img);
+            if scene.has_overlay() && let Some(c) = cam {
+                img = self.overlay_cam(img, &c);
             }
             self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, out, canvas, Some(&self.cs));
         }
@@ -574,6 +732,58 @@ mod tests {
         p.size = 0.4;
         let r = overlay_rect(&p, 1920.0, 1080.0, 16.0 / 9.0);
         assert_eq!((r[0] + r[2], r[1] + r[3]), (1920.0 - 38.0, 1080.0 - 38.0));
+    }
+
+    #[test]
+    fn custom_height() {
+        let a = 16.0 / 9.0;
+        // A tall rectangle: 22% of 1920 wide, half of 1080 tall.
+        let mut p = spec(Shape::Rounded, Place::Corner(Corner::BottomRight));
+        p.height = Some(0.5);
+        assert_eq!(overlay_size(&p, 1920.0, 1080.0, a), (422.0, 540.0));
+        // Never taller than the frame.
+        p.height = Some(1.5);
+        assert_eq!(overlay_size(&p, 1920.0, 1080.0, a), (422.0, 1080.0));
+        // Square shapes are square until given a height (a circle becomes
+        // an ellipse).
+        p.shape = Shape::Circle;
+        p.height = None;
+        assert_eq!(overlay_size(&p, 1920.0, 1080.0, a), (422.0, 422.0));
+        p.height = Some(0.5);
+        assert_eq!(overlay_size(&p, 1920.0, 1080.0, a), (422.0, 540.0));
+    }
+
+    #[test]
+    fn presenter_puts_the_screen_beside_the_camera() {
+        let a = 16.0 / 9.0;
+        // A tall camera at the bottom left: the screen fills the rest,
+        // one margin from the camera and from the right edge.
+        let mut p = spec(Shape::Rounded, Place::Corner(Corner::BottomLeft));
+        (p.size, p.height) = (0.17, Some(0.62));
+        assert_eq!(presenter_screen_rect(&p, 1920.0, 1080.0, a, a), [402.0, 124.0, 1480.0, 833.0]);
+        // Camera on the right: the screen moves left.
+        p.place = Place::Corner(Corner::TopRight);
+        let r = presenter_screen_rect(&p, 1920.0, 1080.0, a, a);
+        assert_eq!((r[0], r[0] + r[2]), (38.0, 1518.0));
+        // A huge camera still leaves the screen a fifth of the width.
+        p.size = 0.9;
+        let r = presenter_screen_rect(&p, 1920.0, 1080.0, a, a);
+        assert!(r[2] >= 1920.0 * 0.2 - 1.0, "{r:?}");
+    }
+
+    #[test]
+    fn camera_zoom_and_pan() {
+        // A 1280x720 camera in a 200x400 portrait overlay fills its height.
+        // Centred, it matches the plain fill.
+        let (s, x, y) = cam_place(1280.0, 720.0, 200.0, 400.0, 1.0, [0.5, 0.5]);
+        let (fs, fx, fy) = fit(1280.0, 720.0, 200.0, 400.0, true);
+        assert!((s - fs).abs() < 1e-12 && (x - fx).abs() < 1e-9 && (y - fy).abs() < 1e-9);
+        // Twice as close, panned to the top-left corner.
+        let (s2, x, y) = cam_place(1280.0, 720.0, 200.0, 400.0, 2.0, [0.0, 0.0]);
+        assert_eq!((s2, x, y), (s * 2.0, 0.0, 0.0));
+        // Panned to the bottom-right: the far edges line up.
+        let (s, x, y) = cam_place(1280.0, 720.0, 200.0, 400.0, 2.0, [1.0, 1.0]);
+        assert!((x + 1280.0 * s - 200.0).abs() < 1e-9 && (y + 720.0 * s - 400.0).abs() < 1e-9);
     }
 
     #[test]
