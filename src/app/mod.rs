@@ -144,6 +144,10 @@ pub struct State {
     pub last_file: Option<PathBuf>,
     pub error: Option<String>,
     pub meters: [Meter; 2],
+    /// How the mic sounds (from the running session), and since when it
+    /// has had a problem.
+    pub mic: Option<crate::voice::MicReport>,
+    pub mic_problem_since: Option<Instant>,
     pub displays: Vec<String>,
     pub windows: Vec<(u32, String)>,
     pub cameras: Vec<Device>,
@@ -309,6 +313,8 @@ impl App {
             last_file: None,
             error: None,
             meters: Default::default(),
+            mic: None,
+            mic_problem_since: None,
             displays: vec![],
             windows: vec![],
             cameras: vec![],
@@ -854,6 +860,9 @@ impl App {
         for (m, l) in self.st.meters.iter_mut().zip(lv) {
             m.feed(l, dt);
         }
+        self.st.mic = sess.and_then(|s| s.mic_report());
+        let problem = self.st.mic.is_some_and(|r| r.verdict.is_bad() || r.verdict.is_warning());
+        self.st.mic_problem_since = if problem { self.st.mic_problem_since.or(Some(Instant::now())) } else { None };
         self.sync_preview();
         self.st.apply_pip();
         let clock = self.st.clock();

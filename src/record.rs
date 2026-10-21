@@ -93,6 +93,8 @@ pub struct Options {
     /// Also write the camera alone next to the output (camera scenes other
     /// than the camera-only one).
     pub save_camera: bool,
+    /// Voice clean-up on the mic in the mix track and streams.
+    pub clean_voice: bool,
     pub cursor: bool,
     pub clicks: bool,
     pub duration: Option<f64>,
@@ -200,7 +202,18 @@ impl Session {
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
-        let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
+        let mut sink = Sink::new(
+            path,
+            &spec,
+            o.system_audio,
+            o.mic.is_some(),
+            o.audio_layout,
+            o.gains_db,
+            o.clean_voice,
+            compositor,
+            o.scene,
+            preview,
+        )?;
         if write && o.save_camera && o.scene != Scene::Cam {
             sink.save_camera(crate::writer::camera_path(&o.output));
         }
@@ -225,7 +238,7 @@ impl Session {
         }
         sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
         if let Some(l) = &o.live {
-            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db);
+            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db, o.clean_voice);
             sink.set_live(l.clone());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -429,6 +442,13 @@ impl Session {
         ok
     }
 
+    /// How the mic sounds right now (None without a mic).
+    pub fn mic_report(&self) -> Option<crate::voice::MicReport> {
+        let mut r = None;
+        self.shared.with(|s| r = s.mic_report());
+        r
+    }
+
     /// (stats, peak levels [system, mic] since last call).
     pub fn poll(&self) -> (Stats, [f32; 2]) {
         let mut st = Stats::default();
@@ -569,6 +589,11 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
             let (st, lv) = sess.poll();
+            let mic = match sess.mic_report() {
+                Some(r) if r.verdict.is_bad() || r.verdict.is_warning() => format!(" ({})", r.verdict.label().to_uppercase()),
+                Some(r) => format!(" ({})", r.verdict.label().to_lowercase()),
+                None => String::new(),
+            };
             let mut live = String::new();
             if let Some(l) = &o.live {
                 if let Some((secs, bytes)) = l.replay_stats() {
@@ -579,7 +604,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
                 }
             }
             eprint!(
-                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{live}  ",
+                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{mic}{live}  ",
                 clock(rec_t),
                 if sess.is_paused() { " PAUSED" } else { "" },
                 st.video_frames_out,

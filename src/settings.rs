@@ -59,6 +59,9 @@ pub struct Settings {
     pub bg_image: Option<PathBuf>,
     /// Also save the camera alone when recording a scene with the overlay.
     pub save_camera: bool,
+    /// Voice clean-up (noise suppression, level, compressor) in the mix
+    /// track and streams; the mic stem stays raw.
+    pub clean_voice: bool,
     pub cursor: bool,
     pub clicks: bool,
     /// Preview at half resolution and 15 fps.
@@ -120,6 +123,7 @@ impl Default for Settings {
             bg_color: PipSpec::default().bg_color,
             bg_image: None,
             save_camera: true,
+            clean_voice: true,
             cursor: true,
             clicks: false,
             preview_low_power: false,
@@ -232,6 +236,7 @@ impl Settings {
             bg_image: d.bg_image.clone(),
             // Only read when a recording starts.
             save_camera: d.save_camera,
+            clean_voice: d.clean_voice,
             preview_low_power: d.preview_low_power,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
@@ -357,6 +362,9 @@ impl Settings {
         }
         if self.save_camera && self.scene.has_overlay() {
             a.push("--save-camera".into());
+        }
+        if self.clean_voice && self.mic_enabled {
+            a.push("--clean-voice".into());
         }
         if !self.cursor {
             a.push("--no-cursor".into());

@@ -33,6 +33,11 @@ pub struct Mixer {
     pub clipped: u64,
     resamplers: [Option<Resampler>; 2],
     limiter: Limiter,
+    /// Voice clean-up on the mic (see `crate::voice`).
+    voice: Option<crate::voice::VoiceChain>,
+    /// Where the mic's next buffer should start (48 kHz samples), to spot
+    /// gaps that restart the chain.
+    voice_next: Option<i64>,
 }
 
 unsafe impl Send for Mixer {}
@@ -235,7 +240,7 @@ fn soft_clip(s: f32) -> f32 {
 }
 
 impl Mixer {
-    pub fn new(t0_secs: f64, system: bool, mic: bool, gain_db: [f32; 2]) -> Self {
+    pub fn new(t0_secs: f64, system: bool, mic: bool, gain_db: [f32; 2], clean_voice: bool) -> Self {
         Mixer {
             t0: (t0_secs * RATE).round() as i64,
             base: 0,
@@ -247,6 +252,8 @@ impl Mixer {
             clipped: 0,
             resamplers: [None, None],
             limiter: Limiter { gain: 1.0 },
+            voice: (mic && clean_voice).then(crate::voice::VoiceChain::new),
+            voice_next: None,
         }
     }
     /// Add decoded frames that start at `pts` (seconds on the output timeline).
@@ -261,6 +268,21 @@ impl Mixer {
         if frames.is_empty() {
             return;
         }
+        // The mic through the voice chain, mono, placed earlier by the
+        // chain's delay so it stays on the picture.
+        let (pts, frames) = match (kind, self.voice.as_mut()) {
+            (AudioKind::Mic, Some(v)) => {
+                let at = (pts * RATE).round() as i64;
+                if self.voice_next.is_some_and(|n| (at - n).abs() > SNAP) {
+                    v.reset();
+                }
+                self.voice_next = Some(at + frames.len() as i64);
+                let mono: Vec<f32> = frames.iter().map(|f| (f[0] + f[1]) * 0.5).collect();
+                let out = v.process(&mono).into_iter().map(|s| [s, s]).collect();
+                (pts - crate::voice::LATENCY as f64 / RATE, out)
+            }
+            _ => (pts, frames),
+        };
         let mut start = (pts * RATE).round() as i64 - self.t0;
         if let Some(h) = self.horizon[i]
             && (start - h).abs() <= SNAP {
@@ -404,7 +426,7 @@ mod tests {
 
     #[test]
     fn sums_sources_on_a_shared_timeline() {
-        let mut m = Mixer::new(10.0, true, true, [0.0, 0.0]);
+        let mut m = Mixer::new(10.0, true, true, [0.0, 0.0], false);
         m.push(AudioKind::System, 10.0, RATE, vec![[0.25, 0.25]; 480]);
         // Nothing until the mic reaches the same point (it may still arrive).
         assert!(m.pull(false).is_none());
@@ -424,7 +446,7 @@ mod tests {
     #[test]
     fn gain_and_limiting() {
         // +6 dB: 0.2 -> 0.399, untouched (under the ceiling).
-        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0]);
+        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0], false);
         m.push(AudioKind::Mic, 0.0, RATE, vec![[0.2, -0.3]; 100]);
         let (_, out) = pull_all(&mut m, true);
         assert!((out[50][0] - 0.399).abs() < 0.01);
@@ -432,7 +454,7 @@ mod tests {
         assert_eq!(m.clipped, 0);
         // Too loud: held under full scale (both channels by the same gain,
         // so the stereo image keeps), never flattened at 1.0.
-        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0]);
+        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0], false);
         m.push(AudioKind::Mic, 0.0, RATE, vec![[0.4, -0.6]; 4800]);
         let (_, out) = pull_all(&mut m, true);
         assert!(out.iter().all(|f| f[0].abs() < 1.0 && f[1].abs() < 1.0));
@@ -445,7 +467,7 @@ mod tests {
     /// A sine through the resampler in uneven buffers: the right length and
     /// pitch, seamless across buffers (error against the ideal 48 kHz sine).
     fn resampled_sine_error(from: f64, freq: f64, chunk: usize) -> (usize, f64) {
-        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0], false);
         let n = from as usize; // 1 s
         let sine = |t: f64| (2.0 * std::f64::consts::PI * freq * t).sin() as f32 * 0.5;
         let mut i = 0;
@@ -479,7 +501,7 @@ mod tests {
     fn resampler_removes_content_above_nyquist() {
         // 20 kHz at 96 kHz cannot pass to 48 kHz unaliased, but is under
         // 24 kHz; 30 kHz must be filtered out rather than fold to 18 kHz.
-        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0], false);
         let frames: Vec<[f32; 2]> = (0..96000)
             .map(|k| { let v = (2.0 * std::f64::consts::PI * 30000.0 * k as f64 / 96000.0).sin() as f32 * 0.5; [v, v] })
             .collect();
@@ -491,7 +513,7 @@ mod tests {
 
     #[test]
     fn small_jitter_snaps_to_continuous() {
-        let mut m = Mixer::new(0.0, true, false, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, true, false, [0.0, 0.0], false);
         m.push(AudioKind::System, 0.0, RATE, vec![[0.1, 0.1]; 480]);
         // 1 ms late: within SNAP, so no gap of silence is inserted.
         m.push(AudioKind::System, 0.011, RATE, vec![[0.1, 0.1]; 480]);
@@ -500,5 +522,45 @@ mod tests {
         assert!(out.iter().all(|f| f[0] == 0.1));
     }
 
-
+    /// The cleaned-up voice lands where the raw voice was (the chain's
+    /// delay is taken back), fed in uneven chunks like a live mic. Speech
+    /// from VOICE_WAV (see `voice::tests`):
+    /// `VOICE_WAV=/tmp/v.wav cargo test clean_voice_stays_in_sync -- --ignored`.
+    #[test]
+    #[ignore]
+    fn clean_voice_stays_in_sync() {
+        let path = std::env::var("VOICE_WAV").expect("VOICE_WAV");
+        let bytes = std::fs::read(path).unwrap();
+        let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let voice: Vec<f32> =
+            bytes[data..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0 * 0.3).collect();
+        let mut m = Mixer::new(5.0, false, true, [0.0, 0.0], true);
+        let (mut at, mut n) = (0usize, 0usize);
+        let mut out = vec![];
+        let mut first = None;
+        while at < voice.len() {
+            let len = [441, 1024, 960, 512][n % 4].min(voice.len() - at);
+            let frames: Vec<[f32; 2]> = voice[at..at + len].iter().map(|s| [*s, *s]).collect();
+            m.push(AudioKind::Mic, 5.0 + at as f64 / RATE, RATE, frames);
+            while let Some((t, f)) = m.pull_frames(false) {
+                first.get_or_insert(t);
+                out.extend(f.into_iter().map(|x| x[0]));
+            }
+            at += len;
+            n += 1;
+        }
+        // Output sample k is at host time first + k / RATE; input sample j at 5 + j / RATE.
+        let offset = ((first.unwrap() - 5.0) * RATE).round() as i64;
+        let corr = |lag: i64| -> f64 {
+            (0..voice.len() as i64)
+                .filter_map(|j| {
+                    let k = j + lag - offset;
+                    (k >= 0 && (k as usize) < out.len()).then(|| voice[j as usize] as f64 * out[k as usize] as f64)
+                })
+                .sum()
+        };
+        let best = (-200..200).max_by(|a, b| corr(*a).total_cmp(&corr(*b))).unwrap();
+        println!("clean voice lands {best} samples ({:.2} ms) from the raw voice", best as f64 / 48.0);
+        assert!(best.abs() <= 2, "{best}");
+    }
 }

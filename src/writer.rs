@@ -93,6 +93,8 @@ pub struct Stats {
     pub camera_file_drops: u64,
     /// Frame slots that sent the previous frame again (nothing changed).
     pub frames_reused: u64,
+    /// How the mic sounded over the recording (see `voice::MicHealth`).
+    pub mic_summary: Option<String>,
     /// Arrival latency (host now - capture pts), max and sum, in seconds.
     pub screen_latency_max: f64,
     pub screen_latency_sum: f64,
@@ -358,6 +360,10 @@ pub struct Sink {
     pub stats: Stats,
     failed: Option<String>,
     levels: [f32; 2],
+    /// Voice clean-up in the mix track and streams.
+    clean_voice: bool,
+    /// Judges the raw mic (absent without one).
+    mic_health: Option<crate::voice::MicHealth>,
 }
 
 unsafe impl Send for Sink {}
@@ -437,12 +443,13 @@ impl Sink {
         mic: bool,
         layout: AudioLayout,
         gains_db: [f32; 2],
+        clean_voice: bool,
         compositor: Option<Compositor>,
         scene: Scene,
         preview: Option<PreviewFn>,
     ) -> Result<Self> {
         let out = match path {
-            Some(p) => Some(open_output(p, v, system_audio, mic, layout)?),
+            Some(p) => Some(open_output(p, v, system_audio, mic, layout, clean_voice)?),
             None => None,
         };
         let own_pool = if out.is_none() && compositor.is_some() {
@@ -488,7 +495,19 @@ impl Sink {
             stats: Stats::default(),
             failed: None,
             levels: [0.0; 2],
+            clean_voice,
+            mic_health: mic.then(crate::voice::MicHealth::new),
         })
+    }
+
+    /// How the mic sounds right now (None without a mic).
+    pub fn mic_report(&self) -> Option<crate::voice::MicReport> {
+        self.mic_health.as_ref().map(|h| h.report())
+    }
+
+    /// How the mic did over the recording, e.g. "good 92%, quiet 8%".
+    pub fn mic_summary(&self) -> Option<String> {
+        self.mic_health.as_ref().and_then(|h| h.summary())
     }
 
     /// Peak levels [system, mic] since the last call (linear, 0..1).
@@ -634,7 +653,7 @@ impl Sink {
         let v = VideoSpec { width: w, height: h, bitrate, ..self.spec.clone() };
         let mic = self.mix_cfg.0[1];
         let mirror = self.compositor.as_ref().is_some_and(|c| c.mirrors());
-        match open_output(&path, &v, false, mic, AudioLayout::Stems) {
+        match open_output(&path, &v, false, mic, AudioLayout::Stems, false) {
             Ok(out) => {
                 unsafe { out.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
                 let pip = crate::compose::PipSpec { mirror, ..Default::default() };
@@ -692,10 +711,13 @@ impl Sink {
                 unsafe { o.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
                 if o.mix_input.is_some() {
                     let (act, g) = self.mix_cfg;
-                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g));
+                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g, self.clean_voice));
                 }
             }
             self.open_cam_iso(t0);
+            if let Some(h) = &mut self.mic_health {
+                h.reset_tally();
+            }
         }
         for (kind, sb) in std::mem::take(&mut self.preroll) {
             self.push_audio(kind, &sb.0);
@@ -753,9 +775,14 @@ impl Sink {
         {
             l.audio(kind, pts_s, *rate, frames.clone());
         }
-        if let Some((_, _, frames)) = &decoded {
+        if let Some((_, rate, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
             self.levels[i] = self.levels[i].max(peak);
+            if kind == AudioKind::Mic
+                && let Some(h) = &mut self.mic_health
+            {
+                h.push(*rate, frames);
+            }
         }
         // Cut the buffer at pause boundaries (sample-accurate: AVAssetWriter
         // lays audio buffers end to end, so a dropped or overlapping piece
@@ -1104,6 +1131,7 @@ impl Sink {
         self.preview = None;
         self.emit_until(end);
         self.drain_mix(true);
+        self.stats.mic_summary = self.mic_summary();
         let end_t = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
         // The camera file first; a failure there never loses the recording.
         if let Some(iso) = &self.cam_iso
@@ -1133,7 +1161,9 @@ impl Sink {
     }
 }
 
-fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout: AudioLayout) -> Result<Out> {
+/// `clean_voice`: the mix track carries the cleaned-up voice, so it is
+/// written even with the mic alone (the mic stem stays the raw original).
+fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout: AudioLayout, clean_voice: bool) -> Result<Out> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
@@ -1189,7 +1219,7 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
         };
         // Track order (documented in README): mix, system, mic.
         let both = system_audio && mic;
-        let want_mix = both && layout != AudioLayout::Stems;
+        let want_mix = (both || (mic && clean_voice)) && layout != AudioLayout::Stems;
         let want_stems = !both || layout != AudioLayout::Mix;
         let mix_input = if want_mix { Some(mk_audio(2, 256_000)?) } else { None };
         let sys = if system_audio && want_stems { Some(mk_audio(2, 256_000)?) } else { None };
@@ -1340,7 +1370,7 @@ mod tests {
                 let path = dir.join(format!("rec-probe-{name}.mov"));
                 let _ = std::fs::remove_file(&path);
                 let spec = super::VideoSpec { width: 320, height: 64, fps: 30, codec: crate::writer::Codec::H264, bitrate: 20_000_000, pixel_format: crate::util::PIX_BGRA };
-                let o = super::open_output(&path, &spec, false, false, super::AudioLayout::Both).unwrap();
+                let o = super::open_output(&path, &spec, false, false, super::AudioLayout::Both, false).unwrap();
                 o.writer.startSessionAtSourceTime(objc2_core_media::CMTime::new(0, 30));
                 let src = crate::compose::color_probe::stripes(320, 64, &vals, tag);
                 // Through the compositor as the camera (full frame) or as is.

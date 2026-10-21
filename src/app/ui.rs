@@ -8,10 +8,73 @@ use super::theme::{self, BODY, SECONDARY, TOOLBAR_H, TRAFFIC_LIGHTS_W};
 use super::{Cmd, Meter, State};
 use crate::compose::{self, Corner, Place, Scene, Shape};
 use crate::settings::Settings;
+use crate::voice::Verdict;
 use crate::settings::{FPS, RESOLUTIONS};
 use crate::writer::{AudioLayout, Codec};
 
 const RED: Color32 = Color32::from_rgb(0xff, 0x3b, 0x30);
+const AMBER: Color32 = Color32::from_rgb(0xff, 0x9f, 0x0a);
+const GREEN: Color32 = Color32::from_rgb(0x34, 0xc7, 0x59);
+
+/// Colour of a mic verdict: green when good, amber for something to look
+/// at, red when the recording would be hard to fix.
+fn verdict_color(v: Verdict, p: &theme::Palette) -> Color32 {
+    if v.is_bad() {
+        RED
+    } else if v.is_warning() {
+        AMBER
+    } else if v == Verdict::Good {
+        GREEN
+    } else {
+        p.tertiary
+    }
+}
+
+/// The mic's verdict as a pill beside the meters; its advice on hover.
+fn mic_badge(ui: &mut Ui, st: &State) {
+    let Some(r) = st.mic.filter(|_| st.settings.mic_enabled) else { return };
+    let p = theme::pal(ui);
+    let v = r.verdict;
+    let col = verdict_color(v, &p);
+    let text = match r.speech_peak_db {
+        Some(db) if v != Verdict::Silent => format!("{}  {db:.0} dB", v.label()),
+        _ => v.label().to_string(),
+    };
+    let mut advice = v.advice().to_string();
+    if r.speech_peak_db.is_some() {
+        advice += "\n\nThe number is your typical speech peak. Aim for about -12 to -6 dB.";
+    }
+    egui::Frame::new()
+        .fill(col.gamma_multiply(0.18))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, col);
+                ui.label(RichText::new(text).size(SECONDARY).color(p.text));
+            });
+        })
+        .response
+        .on_hover_text(advice);
+}
+
+/// A problem that would spoil the recording, across the top of the preview
+/// once it has lasted two seconds.
+fn mic_banner(ui: &Ui, st: &State, preview: egui::Rect) {
+    let (Some(r), Some(since)) = (st.mic, st.mic_problem_since) else { return };
+    if !r.verdict.is_bad() || since.elapsed() < std::time::Duration::from_secs(2) || !st.settings.mic_enabled {
+        return;
+    }
+    let text = format!("Mic: {}. {}", r.verdict.label(), r.verdict.advice());
+    let font = egui::FontId::proportional(BODY);
+    let galley = ui.painter().layout(text, font, Color32::WHITE, preview.width() - 48.0);
+    let size = galley.size() + vec2(24.0, 14.0);
+    let banner = egui::Rect::from_min_size(egui::pos2(preview.center().x - size.x / 2.0, preview.top() + 12.0), size);
+    ui.painter().rect_filled(banner, CornerRadius::same(8), RED.gamma_multiply(0.92));
+    ui.painter().galley(banner.min + vec2(12.0, 7.0), galley, Color32::WHITE);
+}
 const SIDEBAR_W: f32 = 290.0;
 
 static DRAG: AtomicBool = AtomicBool::new(false);
@@ -206,6 +269,7 @@ fn preview(ui: &mut Ui, st: &mut State) {
         if live && st.settings.scene.has_overlay() {
             drag_overlay(ui, st, rect);
         }
+        mic_banner(ui, st, rect);
     });
 }
 
@@ -604,6 +668,8 @@ fn controls(ui: &mut Ui, st: &mut State) {
             meter(ui, "System", st.meters[0], st.settings.system_audio);
             meter(ui, "Mic", st.meters[1], st.settings.mic_enabled);
         });
+        ui.add_space(8.0);
+        mic_badge(ui, st);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Open Folder").clicked() {
                 st.cmds.push(Cmd::OpenFolder);
@@ -775,6 +841,11 @@ fn sources(ui: &mut Ui, st: &mut State) {
     if combo(ui, "mic", &mut s.mic, &mics, idle && s.mic_enabled) {
         s.mic_name = mic_label(&mics, &s.mic);
     }
+    ui.add_enabled(idle && s.mic_enabled, egui::Checkbox::new(&mut s.clean_voice, "Clean up voice")).on_hover_text(
+        "Removes background noise (fans, hum, room tone), evens out your level and gently \
+         compresses loud words, in the main audio track and streams. A raw copy of the mic \
+         is always kept as its own track, so you can redo it in your editor.",
+    );
 
     section(ui, "OUTPUT");
     let codec = s.codec.map_or("Auto codec".to_string(), |c| format!("{c:?}").replace("H264", "H.264").replace("Hevc", "HEVC").replace("Prores", "ProRes 422"));

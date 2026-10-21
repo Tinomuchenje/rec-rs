@@ -14,6 +14,7 @@ mod settings;
 mod synth;
 mod tcc;
 mod util;
+mod voice;
 mod writer;
 
 use std::path::PathBuf;
@@ -203,6 +204,11 @@ pub struct RecordArgs {
     /// frame (camera scenes other than --scene cam).
     #[arg(long)]
     save_camera: bool,
+    /// Clean up the voice in the mix track and streams: noise suppression
+    /// (RNNoise), automatic level and a gentle compressor. The mic stem stays
+    /// the raw original; with the mic alone a mix track is added for it.
+    #[arg(long)]
+    clean_voice: bool,
     /// Hide the mouse cursor.
     #[arg(long)]
     no_cursor: bool,
@@ -445,6 +451,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
             bg_image: a.bg_image.clone(),
         },
         save_camera: a.save_camera,
+        clean_voice: a.clean_voice,
         cursor: !a.no_cursor,
         clicks: a.clicks,
         duration: a.duration,
@@ -605,6 +612,9 @@ fn record(a: RecordArgs) -> Result<()> {
             stats.audio_drops,
             stats.audio_clipped_samples
         );
+        if let Some(m) = &stats.mic_summary {
+            eprintln!("rec: mic: {m}");
+        }
         if stats.camera_file_frames > 0 {
             eprintln!(
                 "rec: saved {} (camera alone: {} video frames, {} dropped)",
