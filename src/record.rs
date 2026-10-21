@@ -557,10 +557,18 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
 
 
     let mut last_status = Instant::now();
+    let mut last_signals = Instant::now();
     let mut warned_no_frames = false;
     let mut saves: Vec<std::thread::JoinHandle<Result<PathBuf>>> = vec![];
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
+        // On macOS 27 the camera stack takes SIGUSR1, SIGUSR2 and SIGINFO
+        // over once a camera starts, which silently broke `rec-rs pause`,
+        // `resume` and `save-replay`. Taking them back each second is enough.
+        if last_signals.elapsed() >= Duration::from_secs(1) {
+            last_signals = Instant::now();
+            install_pause_signals();
+        }
         // Requests wait for the first frame (the timeline starts there).
         if sess.has_frames() && PAUSE_REQ.swap(false, Ordering::SeqCst) && sess.pause() && !o.quiet {
             eprint!("\r\x1b[2Krec: paused (`rec-rs resume` to continue)\n");
