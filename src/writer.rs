@@ -1003,10 +1003,12 @@ impl Sink {
                 break;
             }
             // Encoder busy (e.g. a GPU load spike): retry this slot later
-            // unless it is already too far behind.
+            // unless it is already too far behind. The camera file's encoder
+            // counts too, so both files keep every frame and stay in step.
+            let ready = |o: &Out| unsafe { o.video.isReadyForMoreMediaData() };
             if self.pauses.offset_at(slot as f64).is_some()
                 && let Some(o) = &self.out
-                && !unsafe { o.video.isReadyForMoreMediaData() }
+                && !(ready(o) && self.cam_iso.as_ref().is_none_or(|c| ready(&c.out)))
                 && slot_t > until - MAX_BACKLOG_SECS
             {
                 self.stats.video_retries += 1;
@@ -1095,6 +1097,9 @@ impl Sink {
                         self.stats.camera_file_frames += 1;
                     } else {
                         self.stats.camera_file_drops += 1;
+                        if std::env::var_os("REC_DEBUG").is_some() {
+                            eprintln!("rec: debug: camera file missed output slot {}", self.out_slot - 1);
+                        }
                     }
                 }
             }
