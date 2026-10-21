@@ -4,7 +4,11 @@ use objc2::rc::Retained;
 use objc2_core_foundation::{CFRetained, CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_core_image::{CIColor, CIContext, CIImage};
-use objc2_core_video::CVPixelBuffer;
+use objc2_core_video::{
+    CVAttachmentMode, CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
+    kCVImageBufferCGColorSpaceKey,
+};
 
 use crate::util::*;
 
@@ -352,21 +356,36 @@ fn box_blur(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizont
 
 /// Premultiplied BGRA image of `color` with per-pixel `alpha`.
 fn alpha_image(alpha: &[u8], w: usize, h: usize, color: [u8; 3]) -> Retained<CIImage> {
-    let mut px = Vec::with_capacity(w * h * 4);
-    for &a in alpha {
-        let m = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
-        px.extend_from_slice(&[m(color[2]), m(color[1]), m(color[0]), a]);
-    }
+    let b = surface(w, h);
     unsafe {
-        let data = objc2_foundation::NSData::with_bytes(&px);
-        let cs = CGColorSpace::with_name(Some(kCGColorSpaceSRGB));
-        CIImage::imageWithBitmapData_bytesPerRow_size_format_colorSpace(
-            &data,
-            w * 4,
-            CGSize::new(w as f64, h as f64),
-            objc2_core_image::kCIFormatBGRA8,
-            cs.as_deref(),
-        )
+        CVPixelBufferLockBaseAddress(&b, CVPixelBufferLockFlags(0));
+        let base = CVPixelBufferGetBaseAddress(&b) as *mut u8;
+        let row = CVPixelBufferGetBytesPerRow(&b);
+        for y in 0..h {
+            let line = std::slice::from_raw_parts_mut(base.add(y * row), w * 4);
+            for (px, &a) in line.chunks_exact_mut(4).zip(&alpha[y * w..(y + 1) * w]) {
+                let m = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
+                px.copy_from_slice(&[m(color[2]), m(color[1]), m(color[0]), a]);
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(&b, CVPixelBufferLockFlags(0));
+        CIImage::imageWithCVPixelBuffer(&b)
+    }
+}
+
+/// An IOSurface-backed BGRA buffer tagged sRGB. CoreImage samples these in
+/// place, like camera and screen frames; an image made from bytes in memory
+/// is copied to the GPU on every frame it is drawn.
+fn surface(w: usize, h: usize) -> CFRetained<CVPixelBuffer> {
+    let pool = make_pool(w.max(1), h.max(1), PIX_BGRA);
+    unsafe {
+        let mut b = std::ptr::null_mut();
+        CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut b));
+        let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(std::ptr::NonNull::new(b).expect("pixel buffer"));
+        if let Some(cs) = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)) {
+            b.set_attachment(kCVImageBufferCGColorSpaceKey, cs.as_ref(), CVAttachmentMode::ShouldPropagate);
+        }
+        b
     }
 }
 
@@ -544,7 +563,7 @@ impl Compositor {
 
     /// The presenter background: its color, under its image (scaled to
     /// cover the frame) if one is set and readable. Rendered once per
-    /// change, so a large photo is not decoded every frame.
+    /// change, so a large photo is not decoded or uploaded every frame.
     fn background(&mut self, canvas: CGRect) -> Retained<CIImage> {
         let key = (self.pip.bg_color, self.pip.bg_image.clone());
         if self.bg.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -571,10 +590,10 @@ impl Compositor {
             let (s, tx, ty) = fit(e.size.width, e.size.height, self.w, self.h, true);
             let t = CGAffineTransform { a: s, b: 0.0, c: 0.0, d: s, tx: tx - s * e.origin.x, ty: ty - s * e.origin.y };
             let img = pic.imageByApplyingTransform(t).imageByCompositingOverImage(&img).imageByCroppingToRect(canvas);
-            match self.ctx.createCGImage_fromRect(&img, canvas) {
-                Some(cg) => CIImage::imageWithCGImage(&cg),
-                None => img,
-            }
+            // Drawn once into GPU memory (see `surface`).
+            let b = surface(self.w as usize, self.h as usize);
+            self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, &b, canvas, Some(&self.cs));
+            CIImage::imageWithCVPixelBuffer(&b)
         }
     }
 

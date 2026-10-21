@@ -91,6 +91,8 @@ pub struct Stats {
     /// buffers it missed.
     pub camera_file_frames: u64,
     pub camera_file_drops: u64,
+    /// Frame slots that sent the previous frame again (nothing changed).
+    pub frames_reused: u64,
     /// Arrival latency (host now - capture pts), max and sum, in seconds.
     pub screen_latency_max: f64,
     pub screen_latency_sum: f64,
@@ -220,26 +222,60 @@ pub fn camera_path(output: &Path) -> PathBuf {
     output.with_file_name(format!("{stem}-camera{ext}"))
 }
 
+/// What an output frame was drawn from. The same inputs draw the same
+/// frame, so it is sent again instead of redrawn. The buffers are held, so
+/// a pool cannot recycle one into a new frame at the same address.
+struct FrameKey {
+    screen: Option<CFRetained<CVPixelBuffer>>,
+    cam: Option<CFRetained<CVPixelBuffer>>,
+    scene: Scene,
+    pip_gen: u64,
+}
+
+fn same_buffer(a: &Option<CFRetained<CVPixelBuffer>>, b: &Option<CFRetained<CVPixelBuffer>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq::<CVPixelBuffer>(&**a, &**b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl FrameKey {
+    fn same(&self, o: &FrameKey) -> bool {
+        same_buffer(&self.screen, &o.screen) && same_buffer(&self.cam, &o.cam) && self.scene == o.scene && self.pip_gen == o.pip_gen
+    }
+}
+
 /// The camera alone, full frame, in a second file on the main file's
 /// timeline: same start, same frame slots, same pauses, and the mic.
 struct CamIso {
     out: Out,
     /// Draws the camera full frame, mirrored like the overlay.
     compositor: Compositor,
+    /// The last camera frame drawn and its output, sent again while the
+    /// camera has nothing newer (it usually runs at half the output rate).
+    last: Option<(CFRetained<CVPixelBuffer>, CFRetained<CVPixelBuffer>)>,
 }
 
 impl CamIso {
-    fn append(&mut self, cam: &CVPixelBuffer, pts: CMTime) -> bool {
+    fn append(&mut self, cam: &CFRetained<CVPixelBuffer>, pts: CMTime) -> bool {
         unsafe {
             if !self.out.video.isReadyForMoreMediaData() {
                 return false;
             }
-            let Some(pool) = self.out.adaptor.pixelBufferPool() else { return false };
-            let mut buf = std::ptr::null_mut();
-            CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf));
-            let Some(b) = std::ptr::NonNull::new(buf) else { return false };
-            let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(b);
-            self.compositor.render(Scene::Cam, None, Some(cam), &b);
+            let b = match &self.last {
+                Some((src, out)) if std::ptr::eq::<CVPixelBuffer>(&**src, &**cam) => out.clone(),
+                _ => {
+                    let Some(pool) = self.out.adaptor.pixelBufferPool() else { return false };
+                    let mut buf = std::ptr::null_mut();
+                    CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf));
+                    let Some(b) = std::ptr::NonNull::new(buf) else { return false };
+                    let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(b);
+                    self.compositor.render(Scene::Cam, None, Some(cam), &b);
+                    self.last = Some((cam.clone(), b.clone()));
+                    b
+                }
+            };
             self.out.adaptor.appendPixelBuffer_withPresentationTime(&b, pts)
         }
     }
@@ -316,6 +352,9 @@ pub struct Sink {
     /// Where to save the camera alone; opened when the session starts.
     cam_iso_path: Option<PathBuf>,
     cam_iso: Option<CamIso>,
+    /// Bumped whenever the overlay changes, so the last frame is redrawn.
+    pip_gen: u64,
+    last_frame: Option<(FrameKey, CFRetained<CVPixelBuffer>)>,
     pub stats: Stats,
     failed: Option<String>,
     levels: [f32; 2],
@@ -444,6 +483,8 @@ impl Sink {
             spec: v.clone(),
             cam_iso_path: None,
             cam_iso: None,
+            pip_gen: 0,
+            last_frame: None,
             stats: Stats::default(),
             failed: None,
             levels: [0.0; 2],
@@ -559,7 +600,9 @@ impl Sink {
 
     /// Change the camera overlay live (no-op without a webcam).
     pub fn set_pip(&mut self, pip: crate::compose::PipSpec) {
+        self.pip_gen += 1;
         if let Some(iso) = self.cam_iso.as_mut() {
+            iso.last = None;
             iso.compositor.set_pip(crate::compose::PipSpec { mirror: pip.mirror, ..Default::default() });
         }
         if let Some(c) = self.compositor.as_mut() {
@@ -595,7 +638,7 @@ impl Sink {
             Ok(out) => {
                 unsafe { out.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
                 let pip = crate::compose::PipSpec { mirror, ..Default::default() };
-                self.cam_iso = Some(CamIso { out, compositor: Compositor::new(w, h, pip) });
+                self.cam_iso = Some(CamIso { out, compositor: Compositor::new(w, h, pip), last: None });
             }
             Err(e) => eprintln!("rec: warning: cannot save the camera separately: {e:#}"),
         }
@@ -879,10 +922,48 @@ impl Sink {
         }
     }
 
-    /// Emit every grid slot whose time is at or before `until` (host seconds).
+    /// Draw one output frame: the screen scaled to the output size and,
+    /// with a compositor, the scene. None if no output buffer was free.
     // `compositor.unwrap()` follows an `is_some` check because the output
     // buffer must be taken (borrowing self) before the compositor is borrowed.
     #[allow(clippy::unnecessary_unwrap)]
+    fn draw_frame(
+        &mut self,
+        mut screen: Option<CFRetained<CVPixelBuffer>>,
+        cam: Option<CFRetained<CVPixelBuffer>>,
+    ) -> Option<CFRetained<CVPixelBuffer>> {
+        // A native-size capture going through the compositor: scale it
+        // first (the compositor then draws it 1:1).
+        if let (Some(sc), Some(pool), Some(src)) = (self.scaler.as_mut(), &self.scaled_pool, screen.as_deref())
+            && sc.needed(src)
+        {
+            let mut buf = std::ptr::null_mut();
+            unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf)) };
+            if let Some(b) = std::ptr::NonNull::new(buf) {
+                let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(b) };
+                if sc.scale(src, &b) {
+                    screen = Some(b);
+                }
+            }
+        }
+        if self.compositor.is_some() {
+            let buf = self.new_output_buffer()?;
+            let scene = self.scene;
+            self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
+            Some(buf)
+        } else if self.scaled_pool.is_none()
+            && let Some(sc) = &self.scaler
+            && sc.needed(screen.as_deref()?)
+        {
+            let buf = self.new_output_buffer()?;
+            self.scaler.as_mut().unwrap().scale(screen.as_deref()?, &buf);
+            Some(buf)
+        } else {
+            screen
+        }
+    }
+
+    /// Emit every grid slot whose time is at or before `until` (host seconds).
     pub fn emit_until(&mut self, until: f64) {
         if self.t0.is_none() || self.failed.is_some() {
             return;
@@ -920,21 +1001,7 @@ impl Sink {
                 continue;
             }
             let mut write = write;
-            let mut screen = self.screen_last.as_ref().map(|s| s.0.clone());
-            // A native-size capture going through the compositor: scale it
-            // first (the compositor then draws it 1:1).
-            if let (Some(sc), Some(pool), Some(src)) = (self.scaler.as_mut(), &self.scaled_pool, screen.as_deref())
-                && sc.needed(src)
-            {
-                let mut buf = std::ptr::null_mut();
-                unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf)) };
-                if let Some(b) = std::ptr::NonNull::new(buf) {
-                    let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(b) };
-                    if sc.scale(src, &b) {
-                        screen = Some(b);
-                    }
-                }
-            }
+            let screen = self.screen_last.as_ref().map(|s| s.0.clone());
             if screen.is_none() && self.scene != Scene::Cam {
                 continue;
             }
@@ -950,33 +1017,33 @@ impl Sink {
                     continue;
                 }
             }
-            let frame: CFRetained<CVPixelBuffer> = if self.compositor.is_some() {
-                let Some(buf) = self.new_output_buffer() else {
-                    if write {
-                        self.stats.video_drops += 1;
-                        self.out_slot += 1;
-                    }
-                    continue;
-                };
-                let cam = self.cam_last.as_ref().map(|b| b.0.clone());
-                let scene = self.scene;
-                self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
-                buf
-            } else if self.scaled_pool.is_none()
-                && let Some(sc) = &self.scaler
-                && sc.needed(screen.as_deref().unwrap())
-            {
-                let Some(buf) = self.new_output_buffer() else {
-                    if write {
-                        self.stats.video_drops += 1;
-                        self.out_slot += 1;
-                    }
-                    continue;
-                };
-                self.scaler.as_mut().unwrap().scale(screen.as_deref().unwrap(), &buf);
-                buf
-            } else {
-                screen.unwrap()
+            let cam = self.cam_last.as_ref().map(|b| b.0.clone());
+            // Nothing changed since the last frame: send it again. The screen
+            // only delivers frames when it changes and the camera usually
+            // runs at half the output rate, so most slots skip the redraw.
+            let key = FrameKey {
+                screen: screen.clone(),
+                cam: if self.scene.uses_cam() { cam.clone() } else { None },
+                scene: self.scene,
+                pip_gen: self.pip_gen,
+            };
+            let reused = self.last_frame.as_ref().filter(|(k, _)| k.same(&key)).map(|(_, f)| f.clone());
+            let frame = match reused {
+                Some(f) => {
+                    self.stats.frames_reused += 1;
+                    f
+                }
+                None => {
+                    let Some(f) = self.draw_frame(screen, cam) else {
+                        if write {
+                            self.stats.video_drops += 1;
+                            self.out_slot += 1;
+                        }
+                        continue;
+                    };
+                    self.last_frame = Some((key, f.clone()));
+                    f
+                }
             };
             if write {
                 let pts = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
