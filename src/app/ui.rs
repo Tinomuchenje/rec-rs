@@ -129,7 +129,7 @@ pub fn main_window(ui: &mut Ui, st: &mut State) {
         .frame(egui::Frame::NONE.fill(p.window).inner_margin(Margin::symmetric(12, 0)))
         .show(ui, |ui| {
             toolbar(ui, |ui| {
-                ui.label(RichText::new("Rec").font(theme::semibold(BODY)));
+                ui.label(RichText::new("Tape").font(theme::semibold(BODY)));
                 ui.add_space(6.0);
                 if st.finishing {
                     pill(ui, "SAVING…", p.control, p.secondary);

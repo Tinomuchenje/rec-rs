@@ -1,5 +1,9 @@
 # rec-rs
 
+This fork builds the app as **Tape** (`com.tinomuchenje.rec`), which updates from this
+repository's releases. It tracks [Rec](https://github.com/michaelshimeles/rec-rs) by
+Michael Shimeles, under the same MIT or Apache-2.0 licence.
+
 A simple, fast, reliable screen and camera recorder for macOS, written in Rust, as an alternative
 to OBS for recording YouTube videos. It records the screen, system audio, microphone and webcam
 into one `.mov` or `.mp4` that plays in QuickTime and imports into Final Cut, Premiere and
@@ -64,21 +68,21 @@ the OBS Project. No original OBS code or assets are included in this repository.
 ## Build
 
 ```sh
-./scripts/build.sh          # cargo build --release, then assemble and sign dist/Rec.app
+./scripts/build.sh          # cargo build --release, then assemble and sign dist/Tape.app
 dist/rec-rs --help          # dist/rec is a short alias
 ```
 
 Build output goes to `~/.cache/rec-rs-target` (`CARGO_TARGET_DIR`), never into the repo,
-because the repo is synced between machines. The script signs `dist/Rec.app` with your Apple
+because the repo is synced between machines. The script signs `dist/Tape.app` with your Apple
 Development identity, so the macOS privacy grants survive rebuilds. Override it with
-`REC_SIGN_IDENTITY`. The build is named **Rec Dev** (`com.heyfabrika.rec.dev`), so its grants
+`REC_SIGN_IDENTITY`. The build is named **Tape Dev** (`com.tinomuchenje.rec.dev`), so its grants
 stay apart from those of an installed release, which is signed with another certificate.
 
 `scripts/release-macos.sh` builds the universal (Apple Silicon + Intel) app for macOS 15 and
-later, signs it with a Developer ID certificate, notarizes it and packages `Rec.dmg`, plus the
+later, signs it with a Developer ID certificate, notarizes it and packages `Tape.dmg`, plus the
 zip and signed `appcast.xml` that installed copies update from (one-time credential setup is at
 the top of the script). Installed copies check that feed once a day through
-[Sparkle](https://sparkle-project.org) and offer to install a newer release; Rec › Check for
+[Sparkle](https://sparkle-project.org) and offer to install a newer release; Tape › Check for
 Updates…, also in the menu bar item's menu, checks at once.
 
 Tests:
@@ -99,7 +103,7 @@ Test recordings go to `~/Movies/rec-rs-tests/`.
 dist/rec-rs permissions --request
 ```
 
-Then enable **Rec Dev** (or **Rec**, for the installed app) under **System Settings → Privacy &
+Then enable **Tape Dev** (or **Tape**, for the installed app) under **System Settings → Privacy &
 Security → Screen & System Audio Recording**. Microphone and camera are approved from the
 system prompts. Requesting again, here or with the app's Request Permissions button, first clears
 any earlier Screen Recording decision so that macOS asks again.
@@ -112,7 +116,7 @@ any earlier Screen Recording decision so that macOS asks again.
 ## The app
 
 ```sh
-open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording] [--window ID])
+open dist/Tape.app         # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording] [--window ID])
 ```
 
 The **main window** contains:

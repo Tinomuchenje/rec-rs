@@ -93,32 +93,37 @@ the PR is merged or closed.
 
 ## This repo
 
-rec-rs is Rec, a screen and camera recorder for macOS written in Rust on Apple
-frameworks, plus its download page in `site/`. `README.md` covers the app's
-design and layout, and `site/README.md` covers the page.
+rec-rs is Tape, a screen and camera recorder for macOS written in Rust on Apple
+frameworks. It is Tinomuchenje's fork of
+[Rec](https://github.com/michaelshimeles/rec-rs), with its own bundle ID
+(`com.tinomuchenje.rec`) and update feed. `site/` still holds upstream's
+download page. `README.md` covers the app's design and layout, and
+`site/README.md` covers the page.
 
-- Mutagen syncs `/Users/Shared/projects/rec-rs` to four other machines. Do task
-  work in a separate clone or worktree, and keep build output, recordings,
-  `node_modules` and evidence out of the synced checkout. `scripts/build.sh`
+- The `upstream` remote is michaelshimeles/rec-rs. Bring its changes in by
+  merging `upstream/main` on a task branch, then a PR into `main`. Offer fixes
+  that aren't specific to Tape upstream as well, so the fork stays small.
+- Do task work in a worktree outside the checkout, and keep build output,
+  recordings, `node_modules` and evidence out of it. `scripts/build.sh`
   already builds into `~/.cache/rec-rs-target`, and test recordings go to
   `~/Movies/rec-rs-tests/`.
 - Commit messages are conventional commits, usually scoped to the area they
   touch, such as `feat(app):`, `fix(writer):`, `feat(site):` or `docs:`.
 - rec-rs is a clean-room implementation. Don't copy OBS code or assets, and
-  don't suggest that Rec is affiliated with the OBS Project.
+  don't suggest that Tape is affiliated with the OBS Project.
 - Performance numbers, in the README or on the site, come from measurements
   recorded in `PERFORMANCE.md`.
 - The site stays one fast page with no analytics, tracking or third-party
   requests. Its copy describes features the app ships today.
 - Don't deploy the site, create Vercel projects, or publish releases or tags
-  unless Micky asks.
+  unless Tinomuchenje asks.
 
 ## Checks in this repo
 
 For the app:
 
 - `CARGO_TARGET_DIR=$HOME/.cache/rec-rs-target cargo test` runs the unit tests.
-- `scripts/build.sh` builds and signs `dist/Rec.app`. After it,
+- `scripts/build.sh` builds and signs `dist/Tape.app`. After it,
   `scripts/selftest.sh` records through every pipeline and verifies each file.
   Run it for changes to capture, compositing, encoding, audio or the writer. It
   needs the privacy grants, and `--no-screen` skips the cases that need Screen

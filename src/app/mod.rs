@@ -322,7 +322,7 @@ fn preview_error(e: &anyhow::Error) -> (String, bool) {
     match e.downcast_ref::<record::MissingPermissions>() {
         Some(m) => (
             format!(
-                "Preview unavailable: Rec needs permission for {}. Click Request Permissions, then allow Rec when macOS asks or in System Settings > Privacy & Security.",
+                "Preview unavailable: Tape needs permission for {}. Click Request Permissions, then allow Tape when macOS asks or in System Settings > Privacy & Security.",
                 m.0.join(", ")
             ),
             true,
@@ -490,7 +490,7 @@ impl App {
                 .ok()
                 .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
                 .unwrap_or((1040.0, 660.0));
-            let w = self.open_window(el, "Rec", size, (860.0, 560.0));
+            let w = self.open_window(el, "Tape", size, (860.0, 560.0));
             if std::env::var("REC_MAIN_SIZE").as_deref() == Ok("full") {
                 w.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
             }
@@ -522,7 +522,7 @@ impl App {
 
     fn show_settings(&mut self, el: &ActiveEventLoop) {
         if self.settings_win.is_none() {
-            let w = self.open_window(el, "Rec Settings", (520.0, 820.0), (460.0, 480.0));
+            let w = self.open_window(el, "Tape Settings", (520.0, 820.0), (460.0, 480.0));
             self.settings_win = Some(w);
         }
         if let Some(w) = &self.settings_win {
@@ -1350,7 +1350,7 @@ mod tests {
         assert!(missing);
         assert_eq!(
             msg,
-            "Preview unavailable: Rec needs permission for Screen & System Audio Recording, Microphone. Click Request Permissions, then allow Rec when macOS asks or in System Settings > Privacy & Security."
+            "Preview unavailable: Tape needs permission for Screen & System Audio Recording, Microphone. Click Request Permissions, then allow Tape when macOS asks or in System Settings > Privacy & Security."
         );
         let (msg, missing) = preview_error(&anyhow::anyhow!("no displays"));
         assert!(!missing);

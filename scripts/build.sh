@@ -1,9 +1,9 @@
 #!/bin/sh
-# Build rec, assemble dist/Rec.app, and code-sign it with a stable identity so
+# Build rec, assemble dist/Tape.app, and code-sign it with a stable identity so
 # macOS privacy grants (screen/mic/camera) survive rebuilds.
 #
-# The build is "Rec Dev" (com.heyfabrika.rec.dev), apart from the release's
-# com.heyfabrika.rec. macOS ties each privacy grant to the certificate of the
+# The build is "Tape Dev" (com.tinomuchenje.rec.dev), apart from the release's
+# com.tinomuchenje.rec. macOS ties each privacy grant to the certificate of the
 # app that got it. A copy signed with another certificate under the same bundle
 # ID sees the grant switched on in System Settings, but it never applies.
 set -eu
@@ -12,17 +12,17 @@ PROFILE="${PROFILE:-release}"
 # The repo is synced between machines (Mutagen): keep build output outside it.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rec-rs-target}"
 if [ "$PROFILE" = release ]; then cargo build --release; else cargo build; fi
-APP=dist/Rec.app
-STAGE=dist/.Rec.app.new
-BUNDLE_ID=com.heyfabrika.rec.dev
+APP=dist/Tape.app
+STAGE=dist/.Tape.app.new
+BUNDLE_ID=com.tinomuchenje.rec.dev
 # Build the bundle beside the old one and swap it in atomically: overwriting a
 # running binary in place makes macOS kill an in-progress recording.
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp support/Info.plist "$STAGE/Contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$STAGE/Contents/Info.plist"
-plutil -replace CFBundleName -string "Rec Dev" "$STAGE/Contents/Info.plist"
-plutil -replace CFBundleDisplayName -string "Rec Dev" "$STAGE/Contents/Info.plist"
+plutil -replace CFBundleName -string "Tape Dev" "$STAGE/Contents/Info.plist"
+plutil -replace CFBundleDisplayName -string "Tape Dev" "$STAGE/Contents/Info.plist"
 cp support/AppIcon.icns "$STAGE/Contents/Resources/AppIcon.icns"
 cp "$CARGO_TARGET_DIR/$PROFILE/rec-rs" "$STAGE/Contents/MacOS/rec-rs"
 IDENTITY="${REC_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development|Developer ID Application/ {print $2; exit}')}"
@@ -45,7 +45,7 @@ codesign --verify --strict "$APP"
 # changes (LaunchServices caches them per bundle path).
 touch "$APP"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" || true
-ln -sf "Rec.app/Contents/MacOS/rec-rs" dist/rec-rs
+ln -sf "Tape.app/Contents/MacOS/rec-rs" dist/rec-rs
 ln -sf rec-rs dist/rec  # short alias
 echo "built $APP (signed: $IDENTITY)"
 echo "run:   dist/rec-rs --help"

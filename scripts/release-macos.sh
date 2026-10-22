@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build a universal (Apple Silicon + Intel) Rec.app, sign it with a Developer ID certificate and
-# the hardened runtime, notarize and staple it, then package it as Rec.dmg, itself signed,
+# Build a universal (Apple Silicon + Intel) Tape.app, sign it with a Developer ID certificate and
+# the hardened runtime, notarize and staple it, then package it as Tape.dmg, itself signed,
 # notarized and stapled, with the app icon as its volume icon. That file name is the release asset
-# the download page links to. Next to it go Rec-<version>.zip, the app alone, and appcast.xml,
+# the download page links to. Next to it go Tape-<version>.zip, the app alone, and appcast.xml,
 # the signed update feed that points installed copies at that zip. Everything is written to
 # $CARGO_TARGET_DIR/universal-apple-darwin/release once every step has passed; a failed run leaves
 # the previous build's files there. Upload all three to a release tagged v<version> (the script
@@ -14,17 +14,17 @@
 #
 #   xcrun notarytool store-credentials rec-notary --apple-id you@example.com --team-id TEAMID
 #
-# Updates are signed with the EdDSA key in the login keychain under the account rec, whose public
+# Updates are signed with the EdDSA key in the login keychain under the account tape, whose public
 # half is SUPublicEDKey in support/Info.plist. Keep an exported copy somewhere safe: installed
 # copies accept no other key, so losing it ends their updates.
 #
-#   "$(scripts/fetch-sparkle.sh)/bin/generate_keys" --account rec -x rec-sparkle.key
-#   "$(scripts/fetch-sparkle.sh)/bin/generate_keys" --account rec -f rec-sparkle.key  # on a new Mac
+#   "$(scripts/fetch-sparkle.sh)/bin/generate_keys" --account tape -x tape-sparkle.key
+#   "$(scripts/fetch-sparkle.sh)/bin/generate_keys" --account tape -f tape-sparkle.key  # on a new Mac
 #
 #   SIGN_IDENTITY    signing identity (default: the first "Developer ID Application" in the keychain)
 #   NOTARY_PROFILE   notarytool keychain profile (default: rec-notary)
 #   NOTARY_KEYCHAIN  keychain holding that profile (default: the login keychain)
-#   SPARKLE_ACCOUNT  login keychain account of the update signing key (default: rec)
+#   SPARKLE_ACCOUNT  login keychain account of the update signing key (default: tape)
 #   NOTARIZE=0       sign and package without notarizing or writing the update feed
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -52,9 +52,9 @@ done
 min_macos=$(plutil -extract LSMinimumSystemVersion raw "$plist")
 # Build for the oldest macOS the app supports rather than the compiler's default.
 export MACOSX_DEPLOYMENT_TARGET=$min_macos
-repo=https://github.com/michaelshimeles/rec-rs
+repo=https://github.com/Tinomuchenje/rec-rs
 sparkle=$(scripts/fetch-sparkle.sh)
-sparkle_account=${SPARKLE_ACCOUNT:-rec}
+sparkle_account=${SPARKLE_ACCOUNT:-tape}
 sparkle_key=$(plutil -extract SUPublicEDKey raw "$plist")
 if [ "$notarize" = 1 ]; then
   key=$("$sparkle/bin/generate_keys" --account "$sparkle_account" -p 2>/dev/null || true)
@@ -112,7 +112,7 @@ finish() {
     echo "built $f"
   done
 }
-app=$work/Rec.app
+app=$work/Tape.app
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
 cp "$plist" "$app/Contents/Info.plist"
 cp support/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
@@ -135,19 +135,19 @@ done
 codesign --force --options runtime --timestamp --entitlements support/entitlements.plist --sign "$identity" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 if [ "$notarize" = 1 ]; then
-  ditto -c -k --keepParent "$app" "$tmp/Rec.zip"
-  notarize "$tmp/Rec.zip" "$app"
+  ditto -c -k --keepParent "$app" "$tmp/Tape.zip"
+  notarize "$tmp/Tape.zip" "$app"
 fi
 
-dmg=$work/Rec.dmg
+dmg=$work/Tape.dmg
 stage=$tmp/dmg
 mkdir "$stage" "$tmp/mnt" "$tmp/check"
-ditto "$app" "$stage/Rec.app"
+ditto "$app" "$stage/Tape.app"
 ln -s /Applications "$stage/Applications"
 cp "$app/Contents/Resources/AppIcon.icns" "$stage/.VolumeIcon.icns"
 # -srcfolder drops the volume's custom-icon flag, so it is set on a writable image that is then
 # compressed.
-hdiutil create -volname Rec -srcfolder "$stage" -format UDRW "$tmp/rw.dmg"
+hdiutil create -volname Tape -srcfolder "$stage" -format UDRW "$tmp/rw.dmg"
 hdiutil attach -nobrowse -noautoopen -mountpoint "$tmp/mnt" "$tmp/rw.dmg" >/dev/null
 SetFile -a C "$tmp/mnt"
 hdiutil detach "$tmp/mnt" >/dev/null
@@ -160,13 +160,13 @@ if [ "$notarize" = 1 ]; then
 fi
 # Check the app as a user gets it: dragged out of the finished DMG.
 hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$tmp/check" "$dmg" >/dev/null
-ditto "$tmp/check/Rec.app" "$tmp/copied/Rec.app"
+ditto "$tmp/check/Tape.app" "$tmp/copied/Tape.app"
 hdiutil detach "$tmp/check" >/dev/null
-codesign --verify --deep --strict "$tmp/copied/Rec.app"
-[ "$notarize" = 0 ] || spctl --assess --type execute "$tmp/copied/Rec.app"
+codesign --verify --deep --strict "$tmp/copied/Tape.app"
+[ "$notarize" = 0 ] || spctl --assess --type execute "$tmp/copied/Tape.app"
 
 # ditto keeps the signature and the stapled ticket; plain zip does not.
-zip=$work/Rec-$version.zip
+zip=$work/Tape-$version.zip
 ditto -c -k --keepParent "$app" "$zip"
 [ "$notarize" = 1 ] || { finish; exit 0; }
 
@@ -182,10 +182,10 @@ cat > "$appcast" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
-    <title>Rec</title>
+    <title>Tape</title>
     <link>$repo</link>
     <item>
-      <title>Rec $version</title>
+      <title>Tape $version</title>
       <pubDate>$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')</pubDate>
       <sparkle:version>$version</sparkle:version>
       <sparkle:shortVersionString>$version</sparkle:shortVersionString>
@@ -201,4 +201,4 @@ XML
 "$sparkle/bin/sign_update" --ed-key-file "$key_file" --verify "$appcast"
 rm -f "$key_file"
 finish
-echo "publish with: gh release create v$version $out/Rec.dmg $out/$(basename "$zip") $out/appcast.xml"
+echo "publish with: gh release create v$version $out/Tape.dmg $out/$(basename "$zip") $out/appcast.xml"

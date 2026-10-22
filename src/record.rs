@@ -137,7 +137,7 @@ impl std::fmt::Display for MissingPermissions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "missing permission(s): {}\n  run `rec permissions --request`, then enable Rec in System Settings > Privacy & Security",
+            "missing permission(s): {}\n  run `rec permissions --request`, then enable Tape in System Settings > Privacy & Security",
             self.0.join(", ")
         )
     }
