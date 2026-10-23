@@ -102,8 +102,9 @@ pub struct Options {
     /// Replace the screen with a generated pattern (Some(noise)).
     pub test_pattern: Option<bool>,
     pub audio_layout: AudioLayout,
-    /// Gain in dB for [system, mic] in the mix track.
-    pub gains_db: [f32; 2],
+    /// [system, mic] fader levels at the start; `Session::set_volumes`
+    /// changes them live.
+    pub volumes: [crate::mixer::Volume; 2],
     pub mic_backend: MicBackend,
     /// Initial scene (only Screen without a webcam).
     pub scene: Scene,
@@ -223,7 +224,7 @@ impl Session {
             o.system_audio,
             o.mic.is_some(),
             o.audio_layout,
-            o.gains_db,
+            o.volumes,
             o.clean_voice,
             compositor,
             o.scene,
@@ -253,7 +254,7 @@ impl Session {
         }
         sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
         if let Some(l) = &o.live {
-            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db, o.clean_voice);
+            l.begin_session(o.system_audio, o.mic.is_some(), o.clean_voice);
             sink.set_live(l.clone());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -443,6 +444,12 @@ impl Session {
     /// Move or restyle the camera overlay live; also applies to the file.
     pub fn set_pip(&self, pip: PipSpec) {
         self.shared.with(|s| s.set_pip(pip));
+    }
+
+    /// Move the audio faders [system, mic] live: every track of the file
+    /// and the live encode follow.
+    pub fn set_volumes(&self, volumes: [crate::mixer::Volume; 2]) {
+        self.shared.with(|s| s.set_volumes(volumes));
     }
 
     pub fn cam_aspect(&self) -> Option<f64> {

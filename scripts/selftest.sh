@@ -52,6 +52,65 @@ if scripts/synccheck.py "$OUT/pause.mov" --max-ms 1 >"$OUT/pause.check" 2>&1 \
 else
   echo "FAIL  pause-resume  (see $OUT/pause.check)"; fail=$((fail+1))
 fi
+# Levels: --system-gain reaches the system audio's own track (here the only
+# one). In the app, the system fader moves while recording (0 dB, -12 dB,
+# muted, 0 dB) and the file and the replay buffer follow it.
+if "$REC" record -q --test-pattern --no-mic --system-gain=-12 -t 3 -o "$OUT/gain.mov" >/dev/null 2>"$OUT/gain.log" \
+   && scripts/levelcheck.py "$OUT/gain.mov" --ref=-6 --expect=-12 >"$OUT/gain.check" 2>&1; then
+  echo "PASS  gain  (--system-gain -12 on the system audio track)"; pass=$((pass+1))
+else
+  echo "FAIL  gain  (see $OUT/gain.check)"; fail=$((fail+1))
+fi
+mkdir -p "$OUT/guilevels"
+echo '{"scene": "screen", "mic_enabled": false, "replay_enabled": true, "replay_secs": 30}' >"$OUT/guilevels/settings.json"
+if REC_GUI_SELFTEST=levels REC_TEST_PATTERN=1 REC_GUI_BACKGROUND=1 REC_OUTPUT_DIR="$OUT/guilevels" \
+     REC_SETTINGS="$OUT/guilevels/settings.json" "$REC" gui >"$OUT/guilevels.log" 2>&1 \
+   && f=$(sed -n 's/.*selftest: saved=Some("\(.*\)").*/\1/p' "$OUT/guilevels.log") && [ -n "$f" ] \
+   && r=$(sed -n 's/.*replay saved=Some("\(.*\)") error.*/\1/p' "$OUT/guilevels.log") && [ -n "$r" ] \
+   && scripts/levelcheck.py "$f" --expect 0,-12,mute,0 >"$OUT/guilevels.check" 2>&1 \
+   && scripts/levelcheck.py "$r" --tail --expect 0,-12,mute,0 >>"$OUT/guilevels.check" 2>&1; then
+  echo "PASS  gui-levels  (fader moved while recording: file and replay at 0, -12 dB, muted, 0)"; pass=$((pass+1))
+else
+  echo "FAIL  gui-levels  (see $OUT/guilevels.log, $OUT/guilevels.check)"; fail=$((fail+1))
+fi
+# Opened where it can't update itself, the app makes itself updatable and reopens. macOS runs a
+# quarantined copy that was never moved in Finder from a read-only folder (App Translocation);
+# the flag 00c1 is a download the user already opened. A disk image is read-only. In an
+# Applications folder the app clears the flag in place; elsewhere it moves into Applications. The
+# reopened copy keeps the command line it was started with.
+reopens() {
+  name=$1; dir=$2; app=$3; plan=$4; shift 4
+  open -W -g --stdout "$dir/first.log" --stderr "$dir/first.log" --env REC_GUI_SELFTEST=move --env REC_TEST_PATTERN=1 \
+    --env REC_GUI_HIDDEN=1 --env REC_OUTPUT_DIR="$dir" --env REC_SETTINGS="$dir/settings.json" \
+    --env REC_MOVE_TO="$dir/Applications" "$app" --args gui --window 7
+  i=0; while [ ! -f "$dir/relaunched.txt" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done
+  if grep -q "selftest: $plan" "$dir/first.log" \
+     && grep -qx "exe=$dir/Applications/Rec.app/Contents/MacOS/rec-rs" "$dir/relaunched.txt" \
+     && grep -qx "needs_move=false" "$dir/relaunched.txt" && grep -qx "args=gui --window 7" "$dir/relaunched.txt" \
+     && ! xattr -p com.apple.quarantine "$dir/Applications/Rec.app" >/dev/null 2>&1 && "$@"; then
+    echo "PASS  $name  ($plan, reopened from Applications without the quarantine flag)"; pass=$((pass+1))
+  else
+    echo "FAIL  $name  (see $dir/first.log, $dir/relaunched.txt)"; fail=$((fail+1))
+  fi
+}
+M="$OUT/move"
+mkdir -p "$M/fix/Applications" "$M/download/Downloads" "$M/dmg/src"
+for d in fix download dmg; do echo '{"mic_enabled": false}' >"$M/$d/settings.json"; done
+ditto dist/Rec.app "$M/fix/Applications/Rec.app"
+xattr -w com.apple.quarantine '00c1;00000000;;' "$M/fix/Applications/Rec.app"
+reopens app-fix-translocated "$M/fix" "$M/fix/Applications/Rec.app" Clear true
+ditto dist/Rec.app "$M/download/Downloads/Rec.app"
+xattr -w com.apple.quarantine '00c1;00000000;;' "$M/download/Downloads/Rec.app"
+reopens app-move-download "$M/download" "$M/download/Downloads/Rec.app" Move \
+  sh -c '[ ! -e "$1/Downloads/Rec.app" ] && [ -d "$1/Trash/0-Rec.app" ]' sh "$M/download"
+ditto dist/Rec.app "$M/dmg/src/Rec.app"
+if hdiutil create -quiet -volname Rec -srcfolder "$M/dmg/src" -format UDZO "$M/dmg/Rec.dmg" \
+   && hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$M/dmg/mnt" "$M/dmg/Rec.dmg"; then
+  reopens app-move-dmg "$M/dmg" "$M/dmg/mnt/Rec.app" Move test -d "$M/dmg/mnt/Rec.app"
+  hdiutil detach -quiet "$M/dmg/mnt" || true
+else
+  echo "FAIL  app-move-dmg  (could not make the disk image)"; fail=$((fail+1))
+fi
 # Replay buffer: no file recorded, `rec-rs save-replay` mid-run writes the
 # last seconds to an MP4 that is in sync.
 mkdir -p "$OUT/replay"
@@ -127,6 +186,16 @@ elif [ "${1:-}" != "--no-screen" ]; then
   check screen-1080-all   -t 3
   check screen-4k-webcam  -r 4k --webcam -t 3
   check screen-mix.mp4    -t 2 --audio-tracks mix
+  # The faders on real devices, in their own sample formats: the file plays,
+  # and the mic at the bottom of its fader leaves its track (the third) silent.
+  if "$REC" record -q -t 2 --system-gain=-12 --mic-gain=-60 -o "$OUT/screen-levels.mov" >/dev/null 2>"$OUT/screen-levels.log" \
+     && "$REC" probe "$OUT/screen-levels.mov" >"$OUT/screen-levels.probe" 2>&1 \
+     && [ "$(grep -c '^track' "$OUT/screen-levels.probe")" = 4 ] \
+     && scripts/levelcheck.py "$OUT/screen-levels.mov" --audio 2 --expect mute >"$OUT/screen-levels.check" 2>&1; then
+    echo "PASS  screen-levels  (system -12 dB, mic at the bottom of its fader: mic track silent)"; pass=$((pass+1))
+  else
+    echo "FAIL  screen-levels  (see $OUT/screen-levels.log, .probe, .check)"; fail=$((fail+1))
+  fi
   # App: scripted preview -> record (the hotkey's command) -> pause/resume
   # -> stop -> settings window -> hide window -> quit.
   mkdir -p "$OUT/gui"; echo '{"scene": "screen-cam"}' >"$OUT/gui/settings.json"
