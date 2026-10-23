@@ -37,14 +37,11 @@
 	<string>Tape records your screen and system audio.</string>
 	<!-- Sparkle, embedded by scripts/release-macos.sh, checks this feed once a day and installs
 	     only updates signed with the private half of this key, which `generate_keys --account tape`
-	     keeps in the release Mac's login keychain. Every release must be signed with the same key.
-	     The key below is still upstream's. Before the first Tape release, run `generate_keys
-	     --account tape` and put the public key it prints here; scripts/release-macos.sh refuses
-	     to sign until the keychain key matches it. -->
+	     keeps in the release Mac's login keychain. Every release must be signed with the same key. -->
 	<key>SUFeedURL</key>
 	<string>https://github.com/Tinomuchenje/rec-rs/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>ZyzEfX7pKn+6BqYhGZX1G/o0NLnf4sxBkm3jO0ux3hc=</string>
+	<string>Wyqo29EHXTk84WghwoER1N8Xdtqv/+DvhkzY892BEZU=</string>
 	<key>SURequireSignedFeed</key>
 	<true/>
 	<key>SUVerifyUpdateBeforeExtraction</key>
