@@ -8,6 +8,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{PipSpec, Place, Scene, Shape};
+use crate::mixer::Volume;
 use crate::writer::{AudioLayout, Codec};
 
 pub const RESOLUTIONS: [(&str, &str); 5] =
@@ -54,8 +55,12 @@ pub struct Settings {
     pub mic_name: Option<String>,
     pub system_audio: bool,
     pub audio_tracks: AudioLayout,
+    /// Fader levels in dB (`mixer::MIN_DB` is silence) and mutes. They
+    /// change live, also while recording.
     pub system_gain_db: f32,
     pub mic_gain_db: f32,
+    pub system_muted: bool,
+    pub mic_muted: bool,
     pub pip_size: f64,
     /// Overlay height as a fraction of the frame height; None = camera shape.
     pub pip_height: Option<f64>,
@@ -124,6 +129,8 @@ impl Default for Settings {
             audio_tracks: AudioLayout::Both,
             system_gain_db: 0.0,
             mic_gain_db: 0.0,
+            system_muted: false,
+            mic_muted: false,
             pip_size: PipSpec::default().size,
             pip_height: PipSpec::default().height,
             pip_zoom: PipSpec::default().zoom,
@@ -258,11 +265,24 @@ impl Settings {
         }
     }
 
+    /// The [system, mic] fader levels.
+    pub fn volumes(&self) -> [Volume; 2] {
+        [
+            Volume { db: self.system_gain_db, muted: self.system_muted },
+            Volume { db: self.mic_gain_db, muted: self.mic_muted },
+        ]
+    }
+
     /// The settings that need a new capture session when they change. The
-    /// overlay's look and position are applied live instead.
+    /// overlay's look and position and the audio levels are applied live
+    /// instead.
     pub fn capture_key(&self) -> Settings {
         let d = Settings::default();
         Settings {
+            system_gain_db: d.system_gain_db,
+            mic_gain_db: d.mic_gain_db,
+            system_muted: d.system_muted,
+            mic_muted: d.mic_muted,
             pip_size: d.pip_size,
             pip_height: d.pip_height,
             pip_zoom: d.pip_zoom,
@@ -546,6 +566,17 @@ mod tests {
         assert_eq!((c.width, c.height, c.bitrate, c.hevc), (1920, 1080, 6_000_000, false));
         let c = only(&["youtube", "kick"]).live_config();
         assert_eq!((c.height, c.bitrate, c.hevc), (1080, 8_000_000, false));
+    }
+
+    #[test]
+    fn audio_levels_do_not_restart_capture() {
+        let a = Settings::default();
+        let b = Settings { system_gain_db: -12.0, mic_gain_db: 6.0, mic_muted: true, ..a.clone() };
+        assert_eq!(a.capture_key(), b.capture_key());
+        assert_eq!(b.volumes(), [Volume { db: -12.0, muted: false }, Volume { db: 6.0, muted: true }]);
+        // Settings saved before mute existed load unmuted.
+        let old: Settings = serde_json::from_str(r#"{"mic_gain_db": 3.5}"#).unwrap();
+        assert_eq!(old.volumes()[1], Volume { db: 3.5, muted: false });
     }
 
     #[test]

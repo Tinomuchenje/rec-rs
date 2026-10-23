@@ -141,8 +141,6 @@ struct Encoders {
     mixer: Option<Mixer>,
     /// [system, mic] captured by the current session.
     sources: [bool; 2],
-    /// System and mic gains (dB) in the mix, as in the recording.
-    gains_db: [f32; 2],
     /// Voice clean-up on the mic, as in the recording.
     clean_voice: bool,
     /// Without any audio source, silence is generated up to here.
@@ -193,7 +191,6 @@ impl Default for Live {
                 opus: None,
                 mixer: None,
                 sources: [false; 2],
-                gains_db: [0.0; 2],
                 clean_voice: false,
                 silence_t: None,
                 creating: false,
@@ -263,12 +260,11 @@ impl Live {
         }
     }
 
-    /// A capture session starts: which audio sources it delivers, and their
-    /// gains in the mix (dB).
-    pub fn begin_session(&self, system: bool, mic: bool, gains_db: [f32; 2], clean_voice: bool) {
+    /// A capture session starts: which audio sources it delivers (already
+    /// through their faders), and whether the mic's voice is cleaned up.
+    pub fn begin_session(&self, system: bool, mic: bool, clean_voice: bool) {
         let mut e = self.enc.lock().unwrap();
         e.sources = [system, mic];
-        e.gains_db = gains_db;
         e.clean_voice = clean_voice;
         e.mixer = None;
         e.silence_t = None;
@@ -388,8 +384,8 @@ impl Live {
         }
         let mixed = {
             let mut e = self.enc.lock().unwrap();
-            let (sources, gains, clean) = (e.sources, e.gains_db, e.clean_voice);
-            let m = e.mixer.get_or_insert_with(|| Mixer::new(pts, sources[0], sources[1], gains, clean));
+            let (sources, clean) = (e.sources, e.clean_voice);
+            let m = e.mixer.get_or_insert_with(|| Mixer::new(pts, sources[0], sources[1], clean));
             m.push(kind, pts, rate, frames);
             let mut out = vec![];
             while let Some(x) = m.pull_frames(false) {
@@ -853,9 +849,9 @@ mod tests {
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
         let got = Arc::new(Mutex::new(vec![]));
         live.add_output(Box::new(Collect(got.clone())));
-        live.begin_session(true, false, [0.0, 0.0], false);
+        live.begin_session(true, false, false);
         feed(&live, 2.0, 7000.0);
-        live.begin_session(true, false, [0.0, 0.0], false);
+        live.begin_session(true, false, false);
         feed(&live, 2.0, 7002.25);
         std::thread::sleep(std::time::Duration::from_millis(300));
         let got = got.lock().unwrap();
@@ -876,7 +872,7 @@ mod tests {
     fn sync_probe_60fps_10ms_chunks() {
         let live = Live::new();
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
-        live.begin_session(true, false, [0.0, 0.0], false);
+        live.begin_session(true, false, false);
         live.set_replay(Some(15.0));
         feed_with(&live, 12.0, 6000.0, 60, 480);
         let saved = live.save_replay(std::path::PathBuf::from("/tmp/rec_replay_60.mp4")).unwrap().join().unwrap().unwrap();
@@ -887,7 +883,7 @@ mod tests {
     fn replay_saves_a_playable_mp4() {
         let live = Live::new();
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
-        live.begin_session(true, false, [0.0, 0.0], false);
+        live.begin_session(true, false, false);
         live.set_replay(Some(15.0));
         feed(&live, 20.0, 5000.0);
         let (held, bytes) = live.replay_stats().unwrap();

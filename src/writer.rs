@@ -25,7 +25,7 @@ use objc2_core_video::{
 use objc2_foundation::NSURL;
 
 use crate::compose::{Compositor, Scene};
-use crate::mixer::Mixer;
+use crate::mixer::{Fader, Mixer, Volume};
 use crate::util::*;
 
 pub const TIMESCALE: i32 = 60000;
@@ -312,7 +312,14 @@ pub struct Sink {
     preview: Option<PreviewFn>,
     last_preview: f64,
     mixer: Option<Mixer>,
-    mix_cfg: ([bool; 2], [f32; 2]),
+    /// Sources in the mix [system, mic].
+    mix_sources: [bool; 2],
+    /// Each source's fader, applied before anything uses its audio: the
+    /// mix, its own track, the live encode and the level meter.
+    faders: [Fader; 2],
+    /// Fader gains without mute, for the meters (a muted source still
+    /// shows its level).
+    meter_gain: [f32; 2],
     fps: i64,
     /// Session start on the host clock, in TIMESCALE units.
     t0: Option<i64>,
@@ -442,7 +449,7 @@ impl Sink {
         system_audio: bool,
         mic: bool,
         layout: AudioLayout,
-        gains_db: [f32; 2],
+        volumes: [Volume; 2],
         clean_voice: bool,
         compositor: Option<Compositor>,
         scene: Scene,
@@ -463,7 +470,9 @@ impl Sink {
             preview,
             last_preview: 0.0,
             mixer: None,
-            mix_cfg: ([system_audio, mic], gains_db),
+            mix_sources: [system_audio, mic],
+            faders: volumes.map(|v| Fader::new(v.gain())),
+            meter_gain: volumes.map(Volume::fader_gain),
             fps: v.fps as i64,
             t0: None,
             next_slot: 0,
@@ -510,9 +519,19 @@ impl Sink {
         self.mic_health.as_ref().and_then(|h| h.summary())
     }
 
-    /// Peak levels [system, mic] since the last call (linear, 0..1).
+    /// Peak levels [system, mic] since the last call (linear, 0..1),
+    /// after the faders but before mute.
     pub fn take_levels(&mut self) -> [f32; 2] {
         std::mem::take(&mut self.levels)
+    }
+
+    /// Move the faders: the new levels apply to everything captured from
+    /// now on, in every track and the live encode.
+    pub fn set_volumes(&mut self, volumes: [Volume; 2]) {
+        for (i, v) in volumes.into_iter().enumerate() {
+            self.faders[i].set(v.gain());
+            self.meter_gain[i] = v.fader_gain();
+        }
     }
 
     /// Current emission lag: webcams deliver frames ~70-90 ms after capture,
@@ -651,7 +670,7 @@ impl Sink {
         let px = (w * h) as f64 / (self.spec.width * self.spec.height).max(1) as f64;
         let bitrate = ((self.spec.bitrate as f64 * px) as u64).max(8_000_000);
         let v = VideoSpec { width: w, height: h, bitrate, ..self.spec.clone() };
-        let mic = self.mix_cfg.0[1];
+        let mic = self.mix_sources[1];
         let mirror = self.compositor.as_ref().is_some_and(|c| c.mirrors());
         match open_output(&path, &v, false, mic, AudioLayout::Stems, false) {
             Ok(out) => {
@@ -710,8 +729,8 @@ impl Sink {
             if let Some(o) = &self.out {
                 unsafe { o.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
                 if o.mix_input.is_some() {
-                    let (act, g) = self.mix_cfg;
-                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g, self.clean_voice));
+                    let act = self.mix_sources;
+                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], self.clean_voice));
                 }
             }
             self.open_cam_iso(t0);
@@ -769,26 +788,36 @@ impl Sink {
         // When the sound was heard (see `set_audio_offsets`).
         let real_s = secs(pts);
         let pts_s = real_s + self.audio_offset[i];
-        let decoded = crate::mixer::decode(sb);
-        if let (Some(l), Some((_, rate, frames))) = (&self.live, &decoded)
-            && l.active()
-        {
-            l.audio(kind, pts_s, *rate, frames.clone());
-        }
+        let mut decoded = crate::mixer::decode(sb);
         if let Some((_, rate, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
-            self.levels[i] = self.levels[i].max(peak);
+            self.levels[i] = self.levels[i].max(peak * self.meter_gain[i]);
+            // The health check judges the mic itself, before its fader.
             if kind == AudioKind::Mic
                 && let Some(h) = &mut self.mic_health
             {
                 h.push(*rate, frames);
             }
         }
+        let n = unsafe { sb.num_samples() } as usize;
+        let rate = decoded.as_ref().map_or(48000.0, |d| d.1);
+        // One gain curve for the whole buffer, used by the mix, the live
+        // encode and this source's track alike.
+        let env = self.faders[i].envelope(n, rate);
+        if let (Some(env), Some((_, _, frames))) = (&env, &mut decoded) {
+            for (f, g) in frames.iter_mut().zip(env) {
+                f[0] *= g;
+                f[1] *= g;
+            }
+        }
+        if let (Some(l), Some((_, rate, frames))) = (&self.live, &decoded)
+            && l.active()
+        {
+            l.audio(kind, pts_s, *rate, frames.clone());
+        }
         // Cut the buffer at pause boundaries (sample-accurate: AVAssetWriter
         // lays audio buffers end to end, so a dropped or overlapping piece
         // would shift everything after it).
-        let n = unsafe { sb.num_samples() } as usize;
-        let rate = decoded.as_ref().map_or(48000.0, |d| d.1);
         let to_slot = |t: f64| (t * TIMESCALE as f64 - t0 as f64) / self.tps() as f64;
         let (a, b) = (to_slot(pts_s), to_slot(pts_s + n as f64 / rate));
         let Some((x, y, off)) = self.pauses.keep(a, b) else { return };
@@ -825,6 +854,21 @@ impl Sink {
         if input.is_none() && iso_input.is_none() {
             return;
         }
+        // The tracks get the faded audio in the device's own format.
+        let faded;
+        let sb = match &env {
+            Some(env) => match crate::mixer::scaled(sb, env) {
+                Some(b) => {
+                    faded = b;
+                    &*faded
+                }
+                None => {
+                    self.stats.audio_drops += 1;
+                    return;
+                }
+            },
+            None => sb,
+        };
         // AVAssetWriter lays audio buffers end to end whatever their
         // timestamps say, so keep the track on the capture clock here: fill
         // a gap (late start, dropped device buffer) with silence and trim
