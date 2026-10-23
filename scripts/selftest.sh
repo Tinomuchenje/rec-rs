@@ -85,9 +85,9 @@ reopens() {
     --env REC_MOVE_TO="$dir/Applications" "$app" --args gui --window 7
   i=0; while [ ! -f "$dir/relaunched.txt" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done
   if grep -q "selftest: $plan" "$dir/first.log" \
-     && grep -qx "exe=$dir/Applications/Rec.app/Contents/MacOS/rec-rs" "$dir/relaunched.txt" \
+     && grep -qx "exe=$dir/Applications/Tape.app/Contents/MacOS/rec-rs" "$dir/relaunched.txt" \
      && grep -qx "needs_move=false" "$dir/relaunched.txt" && grep -qx "args=gui --window 7" "$dir/relaunched.txt" \
-     && ! xattr -p com.apple.quarantine "$dir/Applications/Rec.app" >/dev/null 2>&1 && "$@"; then
+     && ! xattr -p com.apple.quarantine "$dir/Applications/Tape.app" >/dev/null 2>&1 && "$@"; then
     echo "PASS  $name  ($plan, reopened from Applications without the quarantine flag)"; pass=$((pass+1))
   else
     echo "FAIL  $name  (see $dir/first.log, $dir/relaunched.txt)"; fail=$((fail+1))
@@ -96,17 +96,17 @@ reopens() {
 M="$OUT/move"
 mkdir -p "$M/fix/Applications" "$M/download/Downloads" "$M/dmg/src"
 for d in fix download dmg; do echo '{"mic_enabled": false}' >"$M/$d/settings.json"; done
-ditto dist/Rec.app "$M/fix/Applications/Rec.app"
-xattr -w com.apple.quarantine '00c1;00000000;;' "$M/fix/Applications/Rec.app"
-reopens app-fix-translocated "$M/fix" "$M/fix/Applications/Rec.app" Clear true
-ditto dist/Rec.app "$M/download/Downloads/Rec.app"
-xattr -w com.apple.quarantine '00c1;00000000;;' "$M/download/Downloads/Rec.app"
-reopens app-move-download "$M/download" "$M/download/Downloads/Rec.app" Move \
-  sh -c '[ ! -e "$1/Downloads/Rec.app" ] && [ -d "$1/Trash/0-Rec.app" ]' sh "$M/download"
-ditto dist/Rec.app "$M/dmg/src/Rec.app"
-if hdiutil create -quiet -volname Rec -srcfolder "$M/dmg/src" -format UDZO "$M/dmg/Rec.dmg" \
-   && hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$M/dmg/mnt" "$M/dmg/Rec.dmg"; then
-  reopens app-move-dmg "$M/dmg" "$M/dmg/mnt/Rec.app" Move test -d "$M/dmg/mnt/Rec.app"
+ditto dist/Tape.app "$M/fix/Applications/Tape.app"
+xattr -w com.apple.quarantine '00c1;00000000;;' "$M/fix/Applications/Tape.app"
+reopens app-fix-translocated "$M/fix" "$M/fix/Applications/Tape.app" Clear true
+ditto dist/Tape.app "$M/download/Downloads/Tape.app"
+xattr -w com.apple.quarantine '00c1;00000000;;' "$M/download/Downloads/Tape.app"
+reopens app-move-download "$M/download" "$M/download/Downloads/Tape.app" Move \
+  sh -c '[ ! -e "$1/Downloads/Tape.app" ] && [ -d "$1/Trash/0-Tape.app" ]' sh "$M/download"
+ditto dist/Tape.app "$M/dmg/src/Tape.app"
+if hdiutil create -quiet -volname Tape -srcfolder "$M/dmg/src" -format UDZO "$M/dmg/Tape.dmg" \
+   && hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$M/dmg/mnt" "$M/dmg/Tape.dmg"; then
+  reopens app-move-dmg "$M/dmg" "$M/dmg/mnt/Tape.app" Move test -d "$M/dmg/mnt/Tape.app"
   hdiutil detach -quiet "$M/dmg/mnt" || true
 else
   echo "FAIL  app-move-dmg  (could not make the disk image)"; fail=$((fail+1))

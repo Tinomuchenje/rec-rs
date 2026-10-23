@@ -467,7 +467,8 @@ mod tests {
                 ..Default::default()
             };
             let mut rect = Rect::NOTHING;
-            let _ = self.ctx.run_ui(input, |ui| rect = fader(ui, db, 300.0, enabled, true).rect);
+            // Nothing applies the font atlas upload, and egui panics if it is dropped unhandled.
+            self.ctx.run_ui(input, |ui| rect = fader(ui, db, 300.0, enabled, true).rect).textures_delta.clear();
             rect
         }
 
@@ -561,7 +562,7 @@ mod tests {
                 })
                 .unwrap_or_default();
             let input = egui::RawInput { events, time: Some(i as f64 / 60.0), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| rect = mute_button(ui, &mut muted, true).rect);
+            ctx.run_ui(input, |ui| rect = mute_button(ui, &mut muted, true).rect).textures_delta.clear();
         }
         assert!(muted);
     }
