@@ -14,6 +14,22 @@ pub const RESOLUTIONS: [(&str, &str); 5] =
     [("720p", "720p"), ("1080p", "1080p"), ("1440p", "1440p"), ("4K", "4k"), ("Native", "native")];
 pub const FPS: [u32; 5] = [24, 25, 30, 50, 60];
 
+/// A stream destination: a service id from `live::SERVICES` or an rtmp(s)://
+/// or WHIP http(s):// URL. Its key lives in the Keychain, never here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamDest {
+    pub dest: String,
+    /// Go Live streams to every enabled destination at once.
+    pub enabled: bool,
+}
+
+impl StreamDest {
+    pub fn is_service(&self) -> bool {
+        crate::live::SERVICES.iter().any(|(id, ..)| *id == self.dest)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -41,6 +57,12 @@ pub struct Settings {
     pub system_gain_db: f32,
     pub mic_gain_db: f32,
     pub pip_size: f64,
+    /// Overlay height as a fraction of the frame height; None = camera shape.
+    pub pip_height: Option<f64>,
+    /// Camera zoom inside the overlay (1 = fill it).
+    pub pip_zoom: f64,
+    /// Which part of the camera shows, 0..1 from the left and top.
+    pub pip_pan: [f64; 2],
     pub pip_place: Place,
     pub pip_shape: Shape,
     pub pip_roundness: f64,
@@ -48,6 +70,14 @@ pub struct Settings {
     pub pip_border_color: [u8; 3],
     pub pip_shadow: bool,
     pub mirror: bool,
+    /// Presenter scene background color, and an optional image over it.
+    pub bg_color: [u8; 3],
+    pub bg_image: Option<PathBuf>,
+    /// Also save the camera alone when recording a scene with the overlay.
+    pub save_camera: bool,
+    /// Voice clean-up (noise suppression, level, compressor) in the mix
+    /// track and streams; the mic stem stays raw.
+    pub clean_voice: bool,
     pub cursor: bool,
     pub clicks: bool,
     /// Preview at half resolution and 15 fps.
@@ -55,10 +85,9 @@ pub struct Settings {
     /// Keep the last `replay_secs` of the live encode in memory.
     pub replay_enabled: bool,
     pub replay_secs: u32,
-    /// "youtube", "twitch", or an rtmp(s):// or WHIP http(s):// URL. The
-    /// stream key lives in the Keychain, never here.
-    pub stream_dest: String,
-    pub stream_custom_url: String,
+    /// Every service, then any custom servers. Go Live starts the enabled
+    /// ones, all fed by the one live encode.
+    pub stream_dests: Vec<StreamDest>,
     /// Live encode (replay buffer and streams).
     pub live_resolution: String,
     pub stream_bitrate_kbps: u32,
@@ -96,6 +125,9 @@ impl Default for Settings {
             system_gain_db: 0.0,
             mic_gain_db: 0.0,
             pip_size: PipSpec::default().size,
+            pip_height: PipSpec::default().height,
+            pip_zoom: PipSpec::default().zoom,
+            pip_pan: PipSpec::default().pan,
             pip_place: PipSpec::default().place,
             pip_shape: PipSpec::default().shape,
             pip_roundness: PipSpec::default().roundness,
@@ -103,13 +135,16 @@ impl Default for Settings {
             pip_border_color: [255, 255, 255],
             pip_shadow: false,
             mirror: true,
+            bg_color: PipSpec::default().bg_color,
+            bg_image: None,
+            save_camera: true,
+            clean_voice: true,
             cursor: true,
             clicks: false,
             preview_low_power: false,
             replay_enabled: false,
             replay_secs: 60,
-            stream_dest: "youtube".into(),
-            stream_custom_url: String::new(),
+            stream_dests: crate::live::SERVICES.iter().map(|(id, ..)| StreamDest { dest: id.to_string(), enabled: *id == "youtube" }).collect(),
             live_resolution: "1080p".into(),
             stream_bitrate_kbps: 6000,
             stream_bitrate_auto: true,
@@ -153,10 +188,7 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let mut s: Settings = std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let mut s = std::fs::read_to_string(Self::path()).ok().and_then(|t| Self::from_json(&t)).unwrap_or_default();
         // 160 kb/s was the default live audio bitrate; 192 is now.
         if s.stream_audio_kbps == 160 {
             s.stream_audio_kbps = 192;
@@ -166,6 +198,37 @@ impl Settings {
             s.output_dir = PathBuf::from(d);
         }
         s
+    }
+
+    /// Parse a settings file. Files from before multi-destination streaming
+    /// name one `stream_dest` ("youtube", "twitch" or "custom" with
+    /// `stream_custom_url`): that one becomes the only enabled destination.
+    /// Every service is listed, in `live::SERVICES` order, before any
+    /// custom servers.
+    fn from_json(text: &str) -> Option<Settings> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        let mut s: Settings = serde_json::from_value(v.clone()).ok()?;
+        if v.get("stream_dests").is_none()
+            && let Some(old) = v.get("stream_dest").and_then(|d| d.as_str())
+        {
+            let custom = v.get("stream_custom_url").and_then(|u| u.as_str()).unwrap_or("").trim();
+            for d in &mut s.stream_dests {
+                d.enabled = d.dest == old;
+            }
+            if old == "custom" && !custom.is_empty() {
+                s.stream_dests.push(StreamDest { dest: custom.to_string(), enabled: true });
+            }
+        }
+        let mut dests: Vec<StreamDest> = crate::live::SERVICES
+            .iter()
+            .map(|(id, ..)| {
+                let saved = s.stream_dests.iter().find(|d| d.dest == *id);
+                StreamDest { dest: id.to_string(), enabled: saved.is_some_and(|d| d.enabled) }
+            })
+            .collect();
+        dests.extend(s.stream_dests.iter().filter(|d| !d.is_service()).cloned());
+        s.stream_dests = dests;
+        Some(s)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -180,6 +243,9 @@ impl Settings {
     pub fn pip_spec(&self) -> PipSpec {
         PipSpec {
             size: self.pip_size,
+            height: self.pip_height,
+            zoom: self.pip_zoom,
+            pan: self.pip_pan,
             place: self.pip_place,
             shape: self.pip_shape,
             roundness: self.pip_roundness,
@@ -187,6 +253,8 @@ impl Settings {
             border_color: self.pip_border_color,
             shadow: self.pip_shadow,
             mirror: self.mirror,
+            bg_color: self.bg_color,
+            bg_image: self.bg_image.clone(),
         }
     }
 
@@ -196,6 +264,9 @@ impl Settings {
         let d = Settings::default();
         Settings {
             pip_size: d.pip_size,
+            pip_height: d.pip_height,
+            pip_zoom: d.pip_zoom,
+            pip_pan: d.pip_pan,
             pip_place: d.pip_place,
             pip_shape: d.pip_shape,
             pip_roundness: d.pip_roundness,
@@ -203,11 +274,15 @@ impl Settings {
             pip_border_color: d.pip_border_color,
             pip_shadow: d.pip_shadow,
             mirror: d.mirror,
+            bg_color: d.bg_color,
+            bg_image: d.bg_image.clone(),
+            // Only read when a recording starts.
+            save_camera: d.save_camera,
+            clean_voice: d.clean_voice,
             preview_low_power: d.preview_low_power,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
-            stream_dest: d.stream_dest.clone(),
-            stream_custom_url: d.stream_custom_url.clone(),
+            stream_dests: d.stream_dests.clone(),
             live_resolution: d.live_resolution.clone(),
             stream_bitrate_kbps: d.stream_bitrate_kbps,
             stream_bitrate_auto: d.stream_bitrate_auto,
@@ -219,33 +294,32 @@ impl Settings {
         }
     }
 
-    /// The stream destination URL (the YouTube and Twitch ingest URLs for
-    /// those choices).
-    pub fn stream_url(&self) -> String {
-        match self.stream_dest.as_str() {
-            "custom" => self.stream_custom_url.trim().to_string(),
-            d => crate::live::destination_url(d),
+    /// Ingest URLs of the enabled destinations (services expanded), without
+    /// blanks or repeats.
+    pub fn stream_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = vec![];
+        for d in self.stream_dests.iter().filter(|d| d.enabled) {
+            let url = crate::live::destination_url(&d.dest);
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
         }
+        urls
     }
 
     /// The live encode these settings describe (sizes above the capture
-    /// are clamped to it by the encoder): the platform's limits, codec and
-    /// recommended bitrate unless set by hand.
+    /// are clamped to it by the encoder): the limits, codec and recommended
+    /// bitrate that suit every enabled destination, unless set by hand.
     pub fn live_config(&self) -> crate::live::LiveConfig {
-        use crate::live::{Platform, platform, preset};
+        use crate::live::{platform, shared_preset};
         let height = match self.live_resolution.as_str() {
             "720p" => 720,
             "1440p" => 1440,
             "4k" => 2160,
             _ => 1080,
         };
-        let p = platform(&self.stream_url());
-        let hevc = match self.stream_codec.as_str() {
-            "hevc" => true,
-            "h264" => false,
-            _ => p == Platform::YouTube,
-        };
-        let (kbps, height, hevc) = preset(p, height, self.fps.min(60), hevc);
+        let platforms: Vec<_> = self.stream_urls().iter().map(|u| platform(u)).collect();
+        let (kbps, height, hevc) = shared_preset(&platforms, height, self.fps.min(60), &self.stream_codec);
         let bitrate = if self.stream_bitrate_auto { kbps } else { self.stream_bitrate_kbps.clamp(500, 80_000) };
         crate::live::LiveConfig {
             width: height * 16 / 9,
@@ -300,6 +374,12 @@ impl Settings {
         a.extend(["--system-gain".into(), format!("{}", self.system_gain_db)]);
         a.extend(["--mic-gain".into(), format!("{}", self.mic_gain_db)]);
         a.extend(["--pip-size".into(), format!("{}", self.pip_size)]);
+        if let Some(h) = self.pip_height {
+            a.extend(["--pip-height".into(), format!("{h}")]);
+        }
+        a.extend(["--pip-zoom".into(), format!("{}", self.pip_zoom)]);
+        let [px, py] = self.pip_pan;
+        a.extend(["--pip-pan".into(), format!("{},{}", px.clamp(0.0, 1.0), py.clamp(0.0, 1.0))]);
         match self.pip_place {
             Place::Corner(c) => a.extend(["--pip-corner".into(), value(c)]),
             Place::At([x, y]) => a.extend(["--pip-pos".into(), format!("{},{}", x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))]),
@@ -314,6 +394,17 @@ impl Settings {
         }
         if !self.mirror {
             a.push("--no-mirror".into());
+        }
+        let [r, g, b] = self.bg_color;
+        a.extend(["--bg-color".into(), format!("{r:02x}{g:02x}{b:02x}")]);
+        if let Some(p) = &self.bg_image {
+            a.extend(["--bg-image".into(), p.to_string_lossy().into_owned()]);
+        }
+        if self.save_camera && self.scene.has_overlay() {
+            a.push("--save-camera".into());
+        }
+        if self.clean_voice && self.mic_enabled {
+            a.push("--clean-voice".into());
         }
         if !self.cursor {
             a.push("--no-cursor".into());
@@ -393,6 +484,68 @@ mod tests {
         assert_eq!(a.capture_key(), b.capture_key());
         let c = Settings { fps: 30, ..a.clone() };
         assert_ne!(a.capture_key(), c.capture_key());
+    }
+
+    fn enabled(s: &Settings) -> Vec<&str> {
+        s.stream_dests.iter().filter(|d| d.enabled).map(|d| d.dest.as_str()).collect()
+    }
+
+    #[test]
+    fn single_stream_dest_of_older_files_migrates() {
+        let s = Settings::from_json(r#"{"stream_dest": "twitch", "stream_custom_url": "rtmp://old/live"}"#).unwrap();
+        assert_eq!(enabled(&s), ["twitch"]);
+        assert_eq!(s.stream_dests.len(), crate::live::SERVICES.len(), "an unused custom URL is not kept");
+        let s = Settings::from_json(r#"{"stream_dest": "custom", "stream_custom_url": " rtmp://host/live "}"#).unwrap();
+        assert_eq!(enabled(&s), ["rtmp://host/live"]);
+        assert_eq!(s.stream_urls(), ["rtmp://host/live"]);
+        // No stream settings at all: the defaults (YouTube on).
+        assert_eq!(enabled(&Settings::from_json("{}").unwrap()), ["youtube"]);
+        // Saved again, the old fields are gone and the list stays.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("stream_dest\"") && !json.contains("stream_custom_url"), "{json}");
+        assert_eq!(Settings::from_json(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn every_service_is_listed_before_custom_servers() {
+        let s = Settings::from_json(r#"{"stream_dests": [{"dest": "rtmp://a/live", "enabled": true}, {"dest": "kick", "enabled": true}]}"#).unwrap();
+        let dests: Vec<&str> = s.stream_dests.iter().map(|d| d.dest.as_str()).collect();
+        assert_eq!(dests, ["youtube", "twitch", "kick", "rtmp://a/live"]);
+        assert_eq!(enabled(&s), ["kick", "rtmp://a/live"]);
+    }
+
+    #[test]
+    fn go_live_targets_every_enabled_destination_once() {
+        let d = |dest: &str, enabled| StreamDest { dest: dest.into(), enabled };
+        let s = Settings {
+            stream_dests: vec![
+                d("youtube", true),
+                d("twitch", true),
+                d("kick", false),
+                d("  ", true),
+                d("rtmp://a/live", true),
+                d("rtmp://a/live", true),
+                d("https://b/whip", false),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(s.stream_urls(), ["rtmps://a.rtmps.youtube.com:443/live2", "rtmps://live.twitch.tv:443/app", "rtmp://a/live"]);
+    }
+
+    #[test]
+    fn live_encode_fits_every_enabled_destination() {
+        let only = |ids: &[&str]| Settings {
+            fps: 60,
+            live_resolution: "4k".into(),
+            stream_dests: ids.iter().map(|id| StreamDest { dest: id.to_string(), enabled: true }).collect(),
+            ..Default::default()
+        };
+        let c = only(&["youtube"]).live_config();
+        assert_eq!((c.height, c.bitrate, c.hevc), (2160, 35_000_000, true));
+        let c = only(&["youtube", "twitch", "kick"]).live_config();
+        assert_eq!((c.width, c.height, c.bitrate, c.hevc), (1920, 1080, 6_000_000, false));
+        let c = only(&["youtube", "kick"]).live_config();
+        assert_eq!((c.height, c.bitrate, c.hevc), (1080, 8_000_000, false));
     }
 
     #[test]

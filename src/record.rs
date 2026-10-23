@@ -90,6 +90,11 @@ pub struct Options {
     pub mic_warning: Option<String>,
     pub webcam: Option<Option<String>>,
     pub pip: PipSpec,
+    /// Also write the camera alone next to the output (camera scenes other
+    /// than the camera-only one).
+    pub save_camera: bool,
+    /// Voice clean-up on the mic in the mix track and streams.
+    pub clean_voice: bool,
     pub cursor: bool,
     pub clicks: bool,
     pub duration: Option<f64>,
@@ -122,6 +127,24 @@ pub enum MicBackend {
     Avcapture,
 }
 
+/// The privacy grants a session needs and doesn't have. It displays as the CLI's
+/// error. The app writes its own banner, which points at its Request
+/// Permissions button.
+#[derive(Debug)]
+pub struct MissingPermissions(pub Vec<&'static str>);
+
+impl std::fmt::Display for MissingPermissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "missing permission(s): {}\n  run `rec permissions --request`, then enable Tape in System Settings > Privacy & Security",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MissingPermissions {}
+
 pub fn check_permissions(o: &Options) -> Result<()> {
     let mut missing = vec![];
     if o.test_pattern.is_none() && tcc::screen_status() != Status::Granted {
@@ -134,10 +157,7 @@ pub fn check_permissions(o: &Options) -> Result<()> {
         missing.push("Camera");
     }
     if !missing.is_empty() {
-        bail!(
-            "missing permission(s): {}\n  run `rec permissions --request`, then enable Rec in System Settings > Privacy & Security",
-            missing.join(", ")
-        );
+        return Err(MissingPermissions(missing).into());
     }
     Ok(())
 }
@@ -197,7 +217,21 @@ impl Session {
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
-        let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
+        let mut sink = Sink::new(
+            path,
+            &spec,
+            o.system_audio,
+            o.mic.is_some(),
+            o.audio_layout,
+            o.gains_db,
+            o.clean_voice,
+            compositor,
+            o.scene,
+            preview,
+        )?;
+        if write && o.save_camera && o.scene != Scene::Cam {
+            sink.save_camera(crate::writer::camera_path(&o.output));
+        }
         if capture_size(o) != (w, h)
             && let Some(sc) = crate::scale::FrameScaler::new(w, h)
         {
@@ -219,7 +253,7 @@ impl Session {
         }
         sink.set_audio_offsets([sys_ms / 1000.0, o.mic_offset_ms / 1000.0]);
         if let Some(l) = &o.live {
-            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db);
+            l.begin_session(o.system_audio, o.mic.is_some(), o.gains_db, o.clean_voice);
             sink.set_live(l.clone());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -308,8 +342,10 @@ impl Session {
         if let Some(c) = cam {
             c.stop();
         }
-        let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
-        if o.mic_backend == MicBackend::Avcapture
+        // Before macOS 15 ScreenCaptureKit has no microphone, so use AVCapture.
+        let mic_backend = if crate::screen::sck_15_features() { o.mic_backend } else { MicBackend::Avcapture };
+        let sck_mic = if mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
+        if mic_backend == MicBackend::Avcapture
             && let Some(sel) = &o.mic
         {
             self.av_mic = Some(Mic::start(sel.as_deref(), self.shared.clone())?);
@@ -421,6 +457,13 @@ impl Session {
         ok
     }
 
+    /// How the mic sounds right now (None without a mic).
+    pub fn mic_report(&self) -> Option<crate::voice::MicReport> {
+        let mut r = None;
+        self.shared.with(|s| r = s.mic_report());
+        r
+    }
+
     /// (stats, peak levels [system, mic] since last call).
     pub fn poll(&self) -> (Stats, [f32; 2]) {
         let mut st = Stats::default();
@@ -514,10 +557,18 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
 
 
     let mut last_status = Instant::now();
+    let mut last_signals = Instant::now();
     let mut warned_no_frames = false;
     let mut saves: Vec<std::thread::JoinHandle<Result<PathBuf>>> = vec![];
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
+        // On macOS 27 the camera stack takes SIGUSR1, SIGUSR2 and SIGINFO
+        // over once a camera starts, which silently broke `rec-rs pause`,
+        // `resume` and `save-replay`. Taking them back each second is enough.
+        if last_signals.elapsed() >= Duration::from_secs(1) {
+            last_signals = Instant::now();
+            install_pause_signals();
+        }
         // Requests wait for the first frame (the timeline starts there).
         if sess.has_frames() && PAUSE_REQ.swap(false, Ordering::SeqCst) && sess.pause() && !o.quiet {
             eprint!("\r\x1b[2Krec: paused (`rec-rs resume` to continue)\n");
@@ -561,6 +612,11 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
             let (st, lv) = sess.poll();
+            let mic = match sess.mic_report() {
+                Some(r) if r.verdict.is_bad() || r.verdict.is_warning() => format!(" ({})", r.verdict.label().to_uppercase()),
+                Some(r) => format!(" ({})", r.verdict.label().to_lowercase()),
+                None => String::new(),
+            };
             let mut live = String::new();
             if let Some(l) = &o.live {
                 if let Some((secs, bytes)) = l.replay_stats() {
@@ -571,7 +627,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
                 }
             }
             eprint!(
-                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{live}  ",
+                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{mic}{live}  ",
                 clock(rec_t),
                 if sess.is_paused() { " PAUSED" } else { "" },
                 st.video_frames_out,

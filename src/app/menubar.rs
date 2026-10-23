@@ -49,6 +49,10 @@ define_class!(
         fn open_folder(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::OpenFolder);
         }
+        #[unsafe(method(checkUpdates:))]
+        fn check_updates(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::CheckForUpdates);
+        }
         #[unsafe(method(quit:))]
         fn quit(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::Quit);
@@ -113,17 +117,18 @@ impl MenuBar {
         let stream = item("Go Live", Some(sel!(toggleStream:)), "");
         menu.addItem(&stream);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&item("Show Rec Window", Some(sel!(showWindow:)), ""));
+        menu.addItem(&item("Show Tape Window", Some(sel!(showWindow:)), ""));
         menu.addItem(&item("Settings…", Some(sel!(showSettings:)), ","));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         let reveal = item("Reveal Last Recording", Some(sel!(revealLast:)), "");
         menu.addItem(&reveal);
         menu.addItem(&item("Open Recordings Folder", Some(sel!(openFolder:)), ""));
+        menu.addItem(&item("Check for Updates…", Some(sel!(checkUpdates:)), ""));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         let hotkey = item("Global hotkey: ⇧⌘R", None, "");
         hotkey.setEnabled(false);
         menu.addItem(&hotkey);
-        menu.addItem(&item("Quit Rec", Some(sel!(quit:)), "q"));
+        menu.addItem(&item("Quit Tape", Some(sel!(quit:)), "q"));
         status.setMenu(Some(&menu));
         let mut mb = MenuBar { status, record, pause, reveal, replay, stream, hotkey, _target: target, last: None };
         mb.update(&View { recording: false, paused: false, finishing: false, clock: "", has_last: false, replay: false, live: false });
@@ -180,7 +185,7 @@ impl MenuBar {
         } else {
             ("record.circle", String::new(), false)
         };
-        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(symbol), Some(&ns("Rec"))) {
+        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(symbol), Some(&ns("Tape"))) {
             img.setTemplate(!red);
             button.setImage(Some(&img));
         }
@@ -191,9 +196,9 @@ impl MenuBar {
 }
 
 /// The app's main menu (it has a Dock icon, so it needs a menu bar):
-/// Rec (About, Settings…, Hide, Quit) and Window (Minimize, Close, Show).
-/// Settings, Show and Quit go through `Cmd`s; the rest are standard
-/// first-responder actions.
+/// Tape (About, Check for Updates…, Settings…, Hide, Quit) and Window
+/// (Minimize, Close, Show). Check for Updates, Settings, Show and Quit go
+/// through `Cmd`s; the rest are standard first-responder actions.
 pub fn install_main_menu(mtm: MainThreadMarker) -> Retained<Target> {
     let target = Target::new(mtm);
     let item = |title: &str, action: Option<Sel>, key: &str, ours: bool| {
@@ -217,17 +222,18 @@ pub fn install_main_menu(mtm: MainThreadMarker) -> Retained<Target> {
     let hide_others = item("Hide Others", Some(sel!(hideOtherApplications:)), "h", false);
     hide_others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     let (app_item, _) = submenu(
-        "Rec",
+        "Tape",
         vec![
-            item("About Rec", Some(sel!(orderFrontStandardAboutPanel:)), "", false),
+            item("About Tape", Some(sel!(orderFrontStandardAboutPanel:)), "", false),
+            item("Check for Updates…", Some(sel!(checkUpdates:)), "", true),
             NSMenuItem::separatorItem(mtm),
             item("Settings…", Some(sel!(showSettings:)), ",", true),
             NSMenuItem::separatorItem(mtm),
-            item("Hide Rec", Some(sel!(hide:)), "h", false),
+            item("Hide Tape", Some(sel!(hide:)), "h", false),
             hide_others,
             item("Show All", Some(sel!(unhideAllApplications:)), "", false),
             NSMenuItem::separatorItem(mtm),
-            item("Quit Rec", Some(sel!(quit:)), "q", true),
+            item("Quit Tape", Some(sel!(quit:)), "q", true),
         ],
     );
     let (win_item, win_menu) = submenu(
@@ -236,7 +242,7 @@ pub fn install_main_menu(mtm: MainThreadMarker) -> Retained<Target> {
             item("Minimize", Some(sel!(performMiniaturize:)), "m", false),
             item("Close", Some(sel!(performClose:)), "w", false),
             NSMenuItem::separatorItem(mtm),
-            item("Show Rec Window", Some(sel!(showWindow:)), "0", true),
+            item("Show Tape Window", Some(sel!(showWindow:)), "0", true),
         ],
     );
     let main = NSMenu::new(mtm);

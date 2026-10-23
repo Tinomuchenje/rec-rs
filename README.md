@@ -1,11 +1,15 @@
 # rec-rs
 
+This fork builds the app as **Tape** (`com.tinomuchenje.rec`), which updates from this
+repository's releases. It tracks [Rec](https://github.com/michaelshimeles/rec-rs) by
+Michael Shimeles, under the same MIT or Apache-2.0 licence.
+
 A simple, fast, reliable screen and camera recorder for macOS, written in Rust, as an alternative
 to OBS for recording YouTube videos. It records the screen, system audio, microphone and webcam
 into one `.mov` or `.mp4` that plays in QuickTime and imports into Final Cut, Premiere and
 DaVinci Resolve. It can also keep a **replay buffer** of the last seconds and **stream** over
-RTMP/RTMPS (YouTube, Twitch, any server) or WHIP (WebRTC), from one shared hardware encode,
-with or without recording.
+RTMP/RTMPS (YouTube, Twitch, Kick, any server) or WHIP (WebRTC) to as many destinations as you
+like at once, from one shared hardware encode, with or without recording.
 
 It uses only Apple frameworks:
 
@@ -26,8 +30,8 @@ It uses only Apple frameworks:
 There is no FFmpeg, OBS or Electron at runtime. The UI is egui on wgpu in the paper-rs style:
 transparent titlebar and the Inter font.
 
-It needs macOS 15 or later on Apple Silicon. It was developed and tested on macOS 27 on an M4
-Pro MacBook Pro.
+It needs macOS 15 or later, and the download runs on Apple Silicon and Intel. It was developed
+and tested on macOS 27 on an M4 Pro MacBook Pro.
 
 The code is a clean-room implementation, licensed MIT OR Apache-2.0. OBS (GPL-2.0) was studied
 for its architecture only and no OBS code was copied. See
@@ -64,14 +68,22 @@ the OBS Project. No original OBS code or assets are included in this repository.
 ## Build
 
 ```sh
-./scripts/build.sh          # cargo build --release, then assemble and sign dist/Rec.app
+./scripts/build.sh          # cargo build --release, then assemble and sign dist/Tape.app
 dist/rec-rs --help          # dist/rec is a short alias
 ```
 
 Build output goes to `~/.cache/rec-rs-target` (`CARGO_TARGET_DIR`), never into the repo,
-because the repo is synced between machines. The script signs `dist/Rec.app` with your Apple
+because the repo is synced between machines. The script signs `dist/Tape.app` with your Apple
 Development identity, so the macOS privacy grants survive rebuilds. Override it with
-`REC_SIGN_IDENTITY`.
+`REC_SIGN_IDENTITY`. The build is named **Tape Dev** (`com.tinomuchenje.rec.dev`), so its grants
+stay apart from those of an installed release, which is signed with another certificate.
+
+`scripts/release-macos.sh` builds the universal (Apple Silicon + Intel) app for macOS 15 and
+later, signs it with a Developer ID certificate, notarizes it and packages `Tape.dmg`, plus the
+zip and signed `appcast.xml` that installed copies update from (one-time credential setup is at
+the top of the script). Installed copies check that feed once a day through
+[Sparkle](https://sparkle-project.org) and offer to install a newer release; Tape › Check for
+Updates…, also in the menu bar item's menu, checks at once.
 
 Tests:
 
@@ -91,8 +103,10 @@ Test recordings go to `~/Movies/rec-rs-tests/`.
 dist/rec-rs permissions --request
 ```
 
-Then enable **Rec** under **System Settings → Privacy & Security → Screen & System Audio
-Recording**. Microphone and camera are approved from the system prompts.
+Then enable **Tape Dev** (or **Tape**, for the installed app) under **System Settings → Privacy &
+Security → Screen & System Audio Recording**. Microphone and camera are approved from the
+system prompts. Requesting again, here or with the app's Request Permissions button, first clears
+any earlier Screen Recording decision so that macOS asks again.
 
 - `rec-rs` re-launches itself with responsibility disclaimed. macOS therefore asks about and
   remembers the signed **Rec** app rather than your terminal.
@@ -102,7 +116,7 @@ Recording**. Microphone and camera are approved from the system prompts.
 ## The app
 
 ```sh
-open dist/Rec.app          # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording] [--window ID])
+open dist/Tape.app         # or: dist/rec-rs   (or: dist/rec-rs gui [--settings] [--start-recording] [--window ID])
 ```
 
 The **main window** contains:
@@ -140,10 +154,17 @@ The **main window** contains:
   **Save Replay** or **⇧⌘S** from anywhere writes it to an MP4 in the output folder without
   stopping anything. ⇧⌘S is only taken while the buffer is on, because it is Save As in most
   apps.
-- **Stream**: YouTube, Twitch or a custom RTMP/RTMPS or WHIP URL. The stream key is typed once
-  and stored in the Keychain (per destination URL), never in the settings file or logs. **Go
-  Live** / **Stop Stream**, with the stream's duration, bitrate and dropped frames, and a LIVE
-  badge.
+- **Stream**: a switch for each of YouTube, Twitch and Kick, plus **Add Server** for any other
+  RTMP/RTMPS server or WHIP endpoint. **Go Live** streams to every destination that's on at
+  once, and **Stop Streaming** stops them all. If one can't start (a missing key, say), none
+  start. Each destination's stream key is typed once and stored in the Keychain (per
+  destination URL), never in the settings file or logs. While live, each destination shows its
+  duration, bitrate and dropped frames, or its reconnect state and last error. The LIVE badge
+  reads LIVE 2/3 when only some of them are up.
+
+  One encode feeds every destination, so it fits all of their limits: YouTube with Twitch
+  streams 1080p H.264 at 6 Mb/s to both. The card shows the shared encode when more than one
+  destination is on.
 
   The replay buffer and the stream run with or without a recording. Starting or stopping a
   recording, or closing the window, doesn't interrupt them: the capture keeps running for them
@@ -231,10 +252,10 @@ frames, and pauses don't count.
 | `--mic-backend` | `sck` | `sck` (ScreenCaptureKit) or `avcapture`. |
 | `--test-pattern [--noise]` | | Synthetic source: the frame flashes white and the "system audio" beeps once a second, for self-tests and sync checks. |
 | `--replay SECS` | off | Keep the last 15–300 s of the live encode in memory; `rec-rs save-replay` writes them to an MP4 next to the output. |
-| `--stream DEST` | | Stream to `youtube`, `twitch`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
+| `--stream DEST` | | Stream to `youtube`, `twitch`, `kick`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
 | `--no-record` | | Write no file (replay buffer and/or streaming only). |
 | `--live-resolution` | `1080p` | Live encode bounding size: the frame keeps its shape and is never above the capture. |
-| `--stream-bitrate` | platform preset | Live video kb/s. By default the platform's recommendation for the size and frame rate: YouTube 2160p60 45 Mb/s H.264 or 35 HEVC (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and 1080p; others like YouTube. |
+| `--stream-bitrate` | platform preset | Live video kb/s. By default the platform's recommendation for the size and frame rate: YouTube 2160p60 45 Mb/s H.264 or 35 HEVC (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and 1080p; Kick at most 8 Mb/s and 1080p; others like YouTube. With several destinations, the lowest bitrate and size among them. |
 | `--stream-codec` | `auto` | `auto` (HEVC when every destination is YouTube), `h264` or `hevc` (HEVC Main10 over enhanced RTMP or WHIP H.265; a server that refuses it gets H.264). |
 | `--keyframe` | `2` | Live keyframe interval in seconds (0.5–4). |
 | `--vbr` | CBR | Average bitrate instead of constant. |
@@ -249,13 +270,15 @@ Other commands:
 - `rec-rs stop`, `rec-rs pause` and `rec-rs resume` control a running recording.
 - `rec-rs save-replay` saves the replay buffer of the running recorder (CLI or app).
 - `rec-rs stream-key DEST [--delete]` stores a stream key in the Keychain (read from the
-  terminal with echo off). `REC_STREAM_KEY` overrides it for one run.
+  terminal with echo off). `REC_STREAM_KEY` overrides it for one run. The app reads and writes
+  the same keys.
 
 ### Replay buffer and streaming
 
 ```sh
-rec-rs stream-key youtube                         # once; key goes to the Keychain
+rec-rs stream-key youtube                         # once per destination; key goes to the Keychain
 rec-rs record --stream youtube --replay 60        # record, stream and keep a replay buffer
+rec-rs record --stream youtube --stream twitch --stream kick   # three platforms, one encode
 rec-rs record --no-record --stream rtmp://localhost/live --stream http://localhost:8889/live/whip
 ```
 
@@ -281,9 +304,10 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Tested** against a local MediaMTX (`brew install mediamtx`), RTMP, RTMPS and WHIP at
   once from one encode: A/V offset in the server's own recordings −0.5 ms (RTMP) and within
   −13 ms (WHIP, of which 6.5 ms is the Opus pre-skip MediaMTX writes into its MP4). Restarting
-  the server reconnects within a few seconds. `scripts/selftest.sh` runs these checks when
-  `mediamtx` is installed. YouTube and Twitch use the same RTMPS path but were not streamed
-  to in testing.
+  the server reconnects within a few seconds. In the app, one Go Live streams to two RTMP paths
+  and a WHIP endpoint at once and keeps all three across a window close and a recording.
+  `scripts/selftest.sh` runs these checks when `mediamtx` is installed. YouTube, Twitch and
+  Kick use the same RTMPS path but were not streamed to in testing.
 
 ## Output format
 
@@ -350,7 +374,7 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | Crash-safe files | ✅ hybrid/fragmented MP4 | ✅ fragments every 2 s |
 | Pause / resume | ✅ | ✅ sample-accurate, app and CLI; the pause is cut from the file, audio stays in sync |
 | Replay buffer | ✅ | ✅ 15–300 s in memory, ⇧⌘S or `save-replay` writes an MP4 without stopping, memory use shown |
-| Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, custom) and WHIP, several at once from one encode, H.264 or HEVC Main10 (enhanced RTMP), platform bitrate presets up to 4K60, auto-reconnect, live status; key in the Keychain |
+| Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, Kick, custom) and WHIP, any number at once from one encode and one Go Live, H.264 or HEVC Main10 (enhanced RTMP), platform bitrate presets up to 4K60, auto-reconnect, live status; key in the Keychain |
 | Screen scaling | GPU bilinear/bicubic/Lanczos | ✅ native capture, Metal Lanczos per plane (5K→4K VMAF 100 vs 90 for ScreenCaptureKit) |
 | Live preview | ✅ | ✅ |
 | Level meters | ✅ | ✅ peak with hold |
@@ -368,10 +392,11 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
   is CLI-only.
 - **Missing features.** There are no audio filters, and the hotkeys aren't configurable.
 - **Streaming.** RTMP/RTMPS (with enhanced-RTMP HEVC) and WHIP only, with no SRT or
-  multitrack. The app streams to one destination at a time; the CLI takes several. The live
-  encode is never larger than the recording size, so a 4K stream needs the 4K output setting.
-  Changing the live encode settings needs the stream stopped. HEVC to YouTube was tested only
-  against a local server, not YouTube itself.
+  multitrack. Every destination gets the same encode, at the lowest limits among them, so
+  adding Twitch caps a 4K YouTube stream at 1080p. The live encode is never larger than the
+  recording size, so a 4K stream needs the 4K output setting. Changing the live encode settings
+  or the destinations needs streaming stopped. HEVC to YouTube was tested only against a local
+  server, not YouTube itself.
 - **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
 - **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
 - **Output latency read once.** It is read when recording starts. Switching output devices
@@ -401,4 +426,6 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | `src/synth.rs` | Test pattern with flash + beep |
 | `src/scale.rs` | Native-resolution screen scaling (Metal Performance Shaders Lanczos, VideoToolbox fallback) |
 | `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
+| `site/` | Download page: SvelteKit, deployed to Vercel (see [site/README.md](site/README.md)) |
+| `AGENTS.md`, `.agents/skills/` | Agent workflow, checks and skills from [michaelshimeles/skills](https://github.com/michaelshimeles/skills); `.claude/skills/` links to the same skills |
 | `analysis/OBS_ARCHITECTURE.md` | OBS study |

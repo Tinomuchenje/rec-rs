@@ -143,6 +143,8 @@ struct Encoders {
     sources: [bool; 2],
     /// System and mic gains (dB) in the mix, as in the recording.
     gains_db: [f32; 2],
+    /// Voice clean-up on the mic, as in the recording.
+    clean_voice: bool,
     /// Without any audio source, silence is generated up to here.
     silence_t: Option<f64>,
     /// A video encoder is being created in the background.
@@ -192,6 +194,7 @@ impl Default for Live {
                 mixer: None,
                 sources: [false; 2],
                 gains_db: [0.0; 2],
+                clean_voice: false,
                 silence_t: None,
                 creating: false,
                 last_frame: None,
@@ -262,10 +265,11 @@ impl Live {
 
     /// A capture session starts: which audio sources it delivers, and their
     /// gains in the mix (dB).
-    pub fn begin_session(&self, system: bool, mic: bool, gains_db: [f32; 2]) {
+    pub fn begin_session(&self, system: bool, mic: bool, gains_db: [f32; 2], clean_voice: bool) {
         let mut e = self.enc.lock().unwrap();
         e.sources = [system, mic];
         e.gains_db = gains_db;
+        e.clean_voice = clean_voice;
         e.mixer = None;
         e.silence_t = None;
     }
@@ -384,8 +388,8 @@ impl Live {
         }
         let mixed = {
             let mut e = self.enc.lock().unwrap();
-            let (sources, gains) = (e.sources, e.gains_db);
-            let m = e.mixer.get_or_insert_with(|| Mixer::new(pts, sources[0], sources[1], gains));
+            let (sources, gains, clean) = (e.sources, e.gains_db, e.clean_voice);
+            let m = e.mixer.get_or_insert_with(|| Mixer::new(pts, sources[0], sources[1], gains, clean));
             m.push(kind, pts, rate, frames);
             let mut out = vec![];
             while let Some(x) = m.pull_frames(false) {
@@ -510,6 +514,25 @@ impl Live {
         id
     }
 
+    /// Start and add an output for every URL, all or nothing: when one can't
+    /// start, the ones added before it are removed again and the error names
+    /// it. Returns each output's ID with its URL.
+    pub fn add_outputs(&self, urls: &[String], start: impl Fn(&str) -> Result<Box<dyn Output>>) -> Result<Vec<(u64, String)>> {
+        let mut added = vec![];
+        for url in urls {
+            match start(url) {
+                Ok(o) => added.push((self.add_output(o), url.clone())),
+                Err(e) => {
+                    for (id, _) in added {
+                        self.remove_output(id);
+                    }
+                    return Err(e.context(format!("Could not go live on {}", destination_name(url))));
+                }
+            }
+        }
+        Ok(added)
+    }
+
     pub fn remove_output(&self, id: u64) {
         let removed = {
             let mut hub = self.hub.lock().unwrap();
@@ -540,13 +563,27 @@ pub fn redact(text: &str, secret: &str) -> String {
     if secret.len() < 4 { text.to_string() } else { text.replace(secret, "••••") }
 }
 
-/// Stream URL for a destination: `youtube` and `twitch` expand to their
-/// RTMPS ingest URLs; anything else is used as given.
+/// Services with one ingest URL for everyone: (id, name, RTMPS URL). Kick's
+/// is the one its help center gives for every channel.
+pub const SERVICES: [(&str, &str, &str); 3] = [
+    ("youtube", "YouTube", "rtmps://a.rtmps.youtube.com:443/live2"),
+    ("twitch", "Twitch", "rtmps://live.twitch.tv:443/app"),
+    ("kick", "Kick", "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"),
+];
+
+/// Stream URL for a destination: a service id (`youtube`, `twitch`,
+/// `kick`) expands to its RTMPS ingest URL; anything else is used as given.
 pub fn destination_url(dest: &str) -> String {
-    match dest.trim().to_lowercase().as_str() {
-        "youtube" => "rtmps://a.rtmps.youtube.com:443/live2".into(),
-        "twitch" => "rtmps://live.twitch.tv:443/app".into(),
-        _ => dest.trim().to_string(),
+    let dest = dest.trim();
+    SERVICES.iter().find(|(id, ..)| dest.eq_ignore_ascii_case(id)).map_or_else(|| dest.to_string(), |(.., url)| url.to_string())
+}
+
+/// What to call a destination in the UI: its service's name, else the
+/// server's host.
+pub fn destination_name(url: &str) -> String {
+    match SERVICES.iter().find(|(.., u)| *u == url) {
+        Some((_, name, _)) => name.to_string(),
+        None => host(url),
     }
 }
 
@@ -555,14 +592,22 @@ pub fn destination_url(dest: &str) -> String {
 pub enum Platform {
     YouTube,
     Twitch,
+    Kick,
     Other,
 }
 
+fn host(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url).split(['/', ':']).next().unwrap_or("").to_lowercase()
+}
+
 pub fn platform(url: &str) -> Platform {
-    let host = url.split("://").nth(1).unwrap_or(url).split(['/', ':']).next().unwrap_or("").to_lowercase();
-    if host.ends_with("youtube.com") {
+    let h = host(url);
+    if h.ends_with("youtube.com") {
         Platform::YouTube
-    } else if host.ends_with("twitch.tv") || host.ends_with("contribute.live-video.net") {
+    } else if h == host(&destination_url("kick")) {
+        // Before Twitch: both ingest on *.contribute.live-video.net.
+        Platform::Kick
+    } else if h.ends_with("twitch.tv") || h.ends_with("contribute.live-video.net") {
         Platform::Twitch
     } else {
         Platform::Other
@@ -575,6 +620,7 @@ pub fn platform(url: &str) -> Platform {
 ///   35, 1440p 24/16, 1080p 12/10, 720p 7.5/5; HEVC (enhanced RTMP) about
 ///   a quarter less (2160p 35/25 Mb/s).
 /// - Twitch: H.264 only, at most 1080p60 and 6 Mb/s (its ingest limits).
+/// - Kick: H.264 only, at most 1080p60 and 8 Mb/s (its encoder requirements).
 pub fn preset(p: Platform, height: usize, fps: u32, hevc: bool) -> (u32, usize, bool) {
     // [H.264 60 fps, H.264 30 fps, HEVC 60 fps, HEVC 30 fps]
     let row = match height {
@@ -586,9 +632,28 @@ pub fn preset(p: Platform, height: usize, fps: u32, hevc: bool) -> (u32, usize, 
     let i = usize::from(fps <= 30);
     match p {
         Platform::Twitch => (row[i].min(6_000), height.min(1080), false),
+        Platform::Kick => (row[i].min(8_000), height.min(1080), false),
         _ if hevc => (row[2 + i], height, true),
         _ => (row[i], height, false),
     }
+}
+
+/// The one encode every destination accepts, as (kb/s, height, HEVC): the
+/// lowest bitrate and height of their presets, and HEVC only if all of them
+/// take it. `codec` is "auto" (HEVC when every destination is YouTube),
+/// "h264" or "hevc". With no destinations (replay buffer only) it is the
+/// generic preset.
+pub fn shared_preset(platforms: &[Platform], height: usize, fps: u32, codec: &str) -> (u32, usize, bool) {
+    let hevc = match codec {
+        "hevc" => true,
+        "h264" => false,
+        _ => !platforms.is_empty() && platforms.iter().all(|p| *p == Platform::YouTube),
+    };
+    platforms
+        .iter()
+        .map(|p| preset(*p, height, fps, hevc))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2 && b.2))
+        .unwrap_or_else(|| preset(Platform::Other, height, fps, hevc))
 }
 
 /// (URL, key) for a destination: the key comes from $REC_STREAM_KEY or the
@@ -687,6 +752,38 @@ mod tests {
         assert_eq!(preset(Platform::YouTube, 1080, 60, false).0, 12_000);
         // Twitch: H.264, at most 1080p and 6 Mb/s.
         assert_eq!(preset(Platform::Twitch, 2160, 60, true), (6_000, 1080, false));
+        // Kick: H.264, at most 1080p and 8 Mb/s.
+        assert_eq!(preset(Platform::Kick, 2160, 60, true), (8_000, 1080, false));
+    }
+
+    #[test]
+    fn services_expand_and_are_recognized() {
+        for (id, name, url) in SERVICES {
+            assert_eq!(destination_url(id), url);
+            assert_eq!(destination_url(&format!(" {} ", id.to_uppercase())), url);
+            assert_eq!(destination_name(url), name);
+        }
+        assert_eq!(platform(&destination_url("kick")), Platform::Kick);
+        // Twitch's own ingests on the same IVS domain stay Twitch.
+        assert_eq!(platform("rtmps://ingest.global-contribute.live-video.net/app"), Platform::Twitch);
+        assert_eq!(destination_url("rtmp://127.0.0.1/live"), "rtmp://127.0.0.1/live");
+        assert_eq!(destination_name("rtmp://127.0.0.1:1935/live"), "127.0.0.1");
+    }
+
+    /// One encode feeds every destination, so it has to fit all of them.
+    #[test]
+    fn shared_preset_fits_every_destination() {
+        use Platform::*;
+        // Replay buffer only: YouTube's numbers, H.264.
+        assert_eq!(shared_preset(&[], 1080, 60, "auto"), (12_000, 1080, false));
+        // YouTube alone gets HEVC on auto, H.264 when asked.
+        assert_eq!(shared_preset(&[YouTube], 2160, 60, "auto"), (35_000, 2160, true));
+        assert_eq!(shared_preset(&[YouTube], 2160, 60, "h264"), (45_000, 2160, false));
+        // With Twitch and Kick: 1080p H.264 at Twitch's 6 Mb/s.
+        assert_eq!(shared_preset(&[YouTube, Twitch, Kick], 2160, 60, "auto"), (6_000, 1080, false));
+        assert_eq!(shared_preset(&[YouTube, Kick], 1440, 60, "hevc"), (8_000, 1080, false));
+        // A custom server with YouTube: auto stays H.264.
+        assert_eq!(shared_preset(&[YouTube, Other], 1080, 30, "auto"), (10_000, 1080, false));
     }
 
     /// Records every packet's (is video, pts).
@@ -706,6 +803,48 @@ mod tests {
         fn stop(&mut self) {}
     }
 
+    /// Named by its URL; notes when it is stopped.
+    struct Probe(String, Arc<Mutex<Vec<String>>>);
+
+    impl Output for Probe {
+        fn packet(&mut self, _p: &Packet, _f: &Formats) {}
+        fn status(&self) -> OutputStatus {
+            OutputStatus { name: self.0.clone(), ..Default::default() }
+        }
+        fn stop(&mut self) {
+            self.1.lock().unwrap().push(self.0.clone());
+        }
+    }
+
+    /// Go Live is all or nothing: when a destination can't start, the ones
+    /// before it are stopped and removed, and the ones after it never start.
+    #[test]
+    fn outputs_start_all_or_nothing() {
+        let live = Live::new();
+        let stopped = Arc::new(Mutex::new(vec![]));
+        let tried = Mutex::new(vec![]);
+        let start = |url: &str| -> Result<Box<dyn Output>> {
+            tried.lock().unwrap().push(url.to_string());
+            if platform(url) == Platform::YouTube {
+                anyhow::bail!("no stream key");
+            }
+            Ok(Box::new(Probe(url.to_string(), stopped.clone())))
+        };
+        let urls = ["rtmp://a/live".to_string(), destination_url("youtube"), "rtmp://c/live".to_string()];
+        let e = live.add_outputs(&urls, start).unwrap_err();
+        assert_eq!(format!("{e:#}"), "Could not go live on YouTube: no stream key");
+        assert_eq!(*tried.lock().unwrap(), ["rtmp://a/live", "rtmps://a.rtmps.youtube.com:443/live2"]);
+        assert_eq!(*stopped.lock().unwrap(), ["rtmp://a/live"]);
+        assert!(live.statuses().is_empty() && !live.active());
+
+        let urls = ["rtmp://a/live".to_string(), "https://b/whip".to_string()];
+        let added = live.add_outputs(&urls, start).unwrap();
+        assert_eq!(added.iter().map(|(_, u)| u.as_str()).collect::<Vec<_>>(), urls);
+        assert_eq!(live.statuses().into_iter().map(|(_, s)| s.name).collect::<Vec<_>>(), urls);
+        assert!(live.active() && stopped.lock().unwrap().len() == 1);
+        live.stop_all();
+    }
+
     /// Swapping capture sessions leaves a hole of a few hundred ms; the
     /// stream must stay continuous (repeated frame, silence).
     #[test]
@@ -714,9 +853,9 @@ mod tests {
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
         let got = Arc::new(Mutex::new(vec![]));
         live.add_output(Box::new(Collect(got.clone())));
-        live.begin_session(true, false, [0.0, 0.0]);
+        live.begin_session(true, false, [0.0, 0.0], false);
         feed(&live, 2.0, 7000.0);
-        live.begin_session(true, false, [0.0, 0.0]);
+        live.begin_session(true, false, [0.0, 0.0], false);
         feed(&live, 2.0, 7002.25);
         std::thread::sleep(std::time::Duration::from_millis(300));
         let got = got.lock().unwrap();
@@ -737,7 +876,7 @@ mod tests {
     fn sync_probe_60fps_10ms_chunks() {
         let live = Live::new();
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
-        live.begin_session(true, false, [0.0, 0.0]);
+        live.begin_session(true, false, [0.0, 0.0], false);
         live.set_replay(Some(15.0));
         feed_with(&live, 12.0, 6000.0, 60, 480);
         let saved = live.save_replay(std::path::PathBuf::from("/tmp/rec_replay_60.mp4")).unwrap().join().unwrap().unwrap();
@@ -748,7 +887,7 @@ mod tests {
     fn replay_saves_a_playable_mp4() {
         let live = Live::new();
         live.set_config(LiveConfig { width: 640, height: 360, bitrate: 1_000_000, keyframe_secs: 1.0, ..Default::default() });
-        live.begin_session(true, false, [0.0, 0.0]);
+        live.begin_session(true, false, [0.0, 0.0], false);
         live.set_replay(Some(15.0));
         feed(&live, 20.0, 5000.0);
         let (held, bytes) = live.replay_stats().unwrap();

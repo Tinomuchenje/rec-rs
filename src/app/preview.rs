@@ -70,6 +70,8 @@ pub fn callback(wake: Arc<dyn Fn() + Send + Sync>) -> PreviewFn {
             .name("preview".into())
             .spawn(move || {
                 let mut w = Worker::new();
+                // The frame on screen and the size and mode it was scaled for.
+                let mut shown: Option<(SendBox<CFRetained<CVPixelBuffer>>, u64, bool)> = None;
                 loop {
                     let frame = {
                         let mut f = FRAME.lock().unwrap();
@@ -79,7 +81,13 @@ pub fn callback(wake: Arc<dyn Fn() + Send + Sync>) -> PreviewFn {
                         f.take().unwrap()
                     };
                     let t = TARGET.load(Ordering::Relaxed);
-                    let out = objc2::rc::autoreleasepool(|_| w.scaled_bgra(&frame.0, ((t >> 32) as u32, t as u32), LOW_POWER.load(Ordering::Relaxed)));
+                    let low = LOW_POWER.load(Ordering::Relaxed);
+                    // The session sends the same buffer again when nothing
+                    // changed: it is already on screen.
+                    if shown.as_ref().is_some_and(|(f, st, sl)| std::ptr::eq::<CVPixelBuffer>(&*f.0, &*frame.0) && *st == t && *sl == low) {
+                        continue;
+                    }
+                    let out = objc2::rc::autoreleasepool(|_| w.scaled_bgra(&frame.0, ((t >> 32) as u32, t as u32), low));
                     if let Some(out) = out
                         && WANTED.load(Ordering::Relaxed)
                     {
@@ -87,6 +95,7 @@ pub fn callback(wake: Arc<dyn Fn() + Send + Sync>) -> PreviewFn {
                         if first {
                             wake();
                         }
+                        shown = Some((frame, t, low));
                     }
                 }
             })

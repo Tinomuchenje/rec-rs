@@ -7,7 +7,7 @@
 //! audio is appended untouched and stays in sync.
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use objc2_av_foundation::*;
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferPool, kCVPixelBufferHeightKey,
+    CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferPool, kCVPixelBufferHeightKey,
     kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
 };
 use objc2_foundation::NSURL;
@@ -87,6 +87,14 @@ pub struct Stats {
     pub video_retries: u64,
     /// Grid slots skipped while paused.
     pub paused_slots: u64,
+    /// Frames written to the camera file, and video frames or audio
+    /// buffers it missed.
+    pub camera_file_frames: u64,
+    pub camera_file_drops: u64,
+    /// Frame slots that sent the previous frame again (nothing changed).
+    pub frames_reused: u64,
+    /// How the mic sounded over the recording (see `voice::MicHealth`).
+    pub mic_summary: Option<String>,
     /// Arrival latency (host now - capture pts), max and sum, in seconds.
     pub screen_latency_max: f64,
     pub screen_latency_sum: f64,
@@ -209,6 +217,94 @@ struct Out {
     mix_input: Option<Retained<AVAssetWriterInput>>,
 }
 
+/// Where the camera alone is saved next to `output`: `name-camera.ext`.
+pub fn camera_path(output: &Path) -> PathBuf {
+    let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    output.with_file_name(format!("{stem}-camera{ext}"))
+}
+
+/// What an output frame was drawn from. The same inputs draw the same
+/// frame, so it is sent again instead of redrawn. The buffers are held, so
+/// a pool cannot recycle one into a new frame at the same address.
+struct FrameKey {
+    screen: Option<CFRetained<CVPixelBuffer>>,
+    cam: Option<CFRetained<CVPixelBuffer>>,
+    scene: Scene,
+    pip_gen: u64,
+}
+
+fn same_buffer(a: &Option<CFRetained<CVPixelBuffer>>, b: &Option<CFRetained<CVPixelBuffer>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq::<CVPixelBuffer>(&**a, &**b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl FrameKey {
+    fn same(&self, o: &FrameKey) -> bool {
+        same_buffer(&self.screen, &o.screen) && same_buffer(&self.cam, &o.cam) && self.scene == o.scene && self.pip_gen == o.pip_gen
+    }
+}
+
+/// The camera alone, full frame, in a second file on the main file's
+/// timeline: same start, same frame slots, same pauses, and the mic.
+struct CamIso {
+    out: Out,
+    /// Draws the camera full frame, mirrored like the overlay.
+    compositor: Compositor,
+    /// The last camera frame drawn and its output, sent again while the
+    /// camera has nothing newer (it usually runs at half the output rate).
+    last: Option<(CFRetained<CVPixelBuffer>, CFRetained<CVPixelBuffer>)>,
+}
+
+impl CamIso {
+    fn append(&mut self, cam: &CFRetained<CVPixelBuffer>, pts: CMTime) -> bool {
+        unsafe {
+            if !self.out.video.isReadyForMoreMediaData() {
+                return false;
+            }
+            let b = match &self.last {
+                Some((src, out)) if std::ptr::eq::<CVPixelBuffer>(&**src, &**cam) => out.clone(),
+                _ => {
+                    let Some(pool) = self.out.adaptor.pixelBufferPool() else { return false };
+                    let mut buf = std::ptr::null_mut();
+                    CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf));
+                    let Some(b) = std::ptr::NonNull::new(buf) else { return false };
+                    let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(b);
+                    self.compositor.render(Scene::Cam, None, Some(cam), &b);
+                    self.last = Some((cam.clone(), b.clone()));
+                    b
+                }
+            };
+            self.out.adaptor.appendPixelBuffer_withPresentationTime(&b, pts)
+        }
+    }
+
+    /// Finalize the file, ending it at `end` like the main file.
+    fn finish(&self, end: CMTime) -> Result<()> {
+        let o = &self.out;
+        unsafe {
+            o.writer.endSessionAtSourceTime(end);
+            o.video.markAsFinished();
+            for a in [&o.sys, &o.mic, &o.mix_input].into_iter().flatten() {
+                a.markAsFinished();
+            }
+            let (tx, rx) = mpsc::channel();
+            let block = RcBlock::new(move || {
+                let _ = tx.send(());
+            });
+            o.writer.finishWritingWithCompletionHandler(&block);
+            rx.recv_timeout(Duration::from_secs(60)).context("timed out finalizing the camera file")?;
+            if o.writer.status() != AVAssetWriterStatus::Completed {
+                bail!("writing the camera file failed: {}", err_text(&o.writer));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Sink {
     out: Option<Out>,
     /// Compositor output pool when there is no writer adaptor pool.
@@ -253,9 +349,21 @@ pub struct Sink {
     scaled_pool: Option<CFRetained<CVPixelBufferPool>>,
     /// Output size and pixel format (for a pool created later).
     out_spec: (usize, usize, u32),
+    /// The main file's video settings (the camera file derives its own).
+    spec: VideoSpec,
+    /// Where to save the camera alone; opened when the session starts.
+    cam_iso_path: Option<PathBuf>,
+    cam_iso: Option<CamIso>,
+    /// Bumped whenever the overlay changes, so the last frame is redrawn.
+    pip_gen: u64,
+    last_frame: Option<(FrameKey, CFRetained<CVPixelBuffer>)>,
     pub stats: Stats,
     failed: Option<String>,
     levels: [f32; 2],
+    /// Voice clean-up in the mix track and streams.
+    clean_voice: bool,
+    /// Judges the raw mic (absent without one).
+    mic_health: Option<crate::voice::MicHealth>,
 }
 
 unsafe impl Send for Sink {}
@@ -335,12 +443,13 @@ impl Sink {
         mic: bool,
         layout: AudioLayout,
         gains_db: [f32; 2],
+        clean_voice: bool,
         compositor: Option<Compositor>,
         scene: Scene,
         preview: Option<PreviewFn>,
     ) -> Result<Self> {
         let out = match path {
-            Some(p) => Some(open_output(p, v, system_audio, mic, layout)?),
+            Some(p) => Some(open_output(p, v, system_audio, mic, layout, clean_voice)?),
             None => None,
         };
         let own_pool = if out.is_none() && compositor.is_some() {
@@ -378,10 +487,27 @@ impl Sink {
             cam_gate: None,
             scaled_pool: None,
             out_spec: (v.width, v.height, v.pixel_format),
+            spec: v.clone(),
+            cam_iso_path: None,
+            cam_iso: None,
+            pip_gen: 0,
+            last_frame: None,
             stats: Stats::default(),
             failed: None,
             levels: [0.0; 2],
+            clean_voice,
+            mic_health: mic.then(crate::voice::MicHealth::new),
         })
+    }
+
+    /// How the mic sounds right now (None without a mic).
+    pub fn mic_report(&self) -> Option<crate::voice::MicReport> {
+        self.mic_health.as_ref().map(|h| h.report())
+    }
+
+    /// How the mic did over the recording, e.g. "good 92%, quiet 8%".
+    pub fn mic_summary(&self) -> Option<String> {
+        self.mic_health.as_ref().and_then(|h| h.summary())
     }
 
     /// Peak levels [system, mic] since the last call (linear, 0..1).
@@ -493,8 +619,47 @@ impl Sink {
 
     /// Change the camera overlay live (no-op without a webcam).
     pub fn set_pip(&mut self, pip: crate::compose::PipSpec) {
+        self.pip_gen += 1;
+        if let Some(iso) = self.cam_iso.as_mut() {
+            iso.last = None;
+            iso.compositor.set_pip(crate::compose::PipSpec { mirror: pip.mirror, ..Default::default() });
+        }
         if let Some(c) = self.compositor.as_mut() {
             c.set_pip(pip);
+        }
+    }
+
+    /// Also save the camera alone to `path` (see `CamIso`). Needs a written
+    /// session with a camera; the file opens when the session starts.
+    pub fn save_camera(&mut self, path: PathBuf) {
+        if self.out.is_some() && self.compositor.is_some() {
+            self.cam_iso_path = Some(path);
+        }
+    }
+
+    /// Open the camera file at the session start `t0`, sized to the camera.
+    /// Failure only loses the camera file, never the recording.
+    fn open_cam_iso(&mut self, t0: i64) {
+        let Some(path) = self.cam_iso_path.take() else { return };
+        let cam = self.cam_q.back().map(|c| c.1.0.clone()).or_else(|| self.cam_last.as_ref().map(|c| c.0.clone()));
+        let Some(cam) = cam else {
+            eprintln!("rec: warning: no camera picture at the start; the camera is not saved separately");
+            return;
+        };
+        let (w, h) = (CVPixelBufferGetWidth(&cam) & !1, CVPixelBufferGetHeight(&cam) & !1);
+        // The main file's quality per pixel, at least 8 Mb/s.
+        let px = (w * h) as f64 / (self.spec.width * self.spec.height).max(1) as f64;
+        let bitrate = ((self.spec.bitrate as f64 * px) as u64).max(8_000_000);
+        let v = VideoSpec { width: w, height: h, bitrate, ..self.spec.clone() };
+        let mic = self.mix_cfg.0[1];
+        let mirror = self.compositor.as_ref().is_some_and(|c| c.mirrors());
+        match open_output(&path, &v, false, mic, AudioLayout::Stems, false) {
+            Ok(out) => {
+                unsafe { out.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
+                let pip = crate::compose::PipSpec { mirror, ..Default::default() };
+                self.cam_iso = Some(CamIso { out, compositor: Compositor::new(w, h, pip), last: None });
+            }
+            Err(e) => eprintln!("rec: warning: cannot save the camera separately: {e:#}"),
         }
     }
 
@@ -546,8 +711,12 @@ impl Sink {
                 unsafe { o.writer.startSessionAtSourceTime(CMTime::new(t0, TIMESCALE)) };
                 if o.mix_input.is_some() {
                     let (act, g) = self.mix_cfg;
-                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g));
+                    self.mixer = Some(Mixer::new(t0 as f64 / TIMESCALE as f64, act[0], act[1], g, self.clean_voice));
                 }
+            }
+            self.open_cam_iso(t0);
+            if let Some(h) = &mut self.mic_health {
+                h.reset_tally();
             }
         }
         for (kind, sb) in std::mem::take(&mut self.preroll) {
@@ -606,9 +775,14 @@ impl Sink {
         {
             l.audio(kind, pts_s, *rate, frames.clone());
         }
-        if let Some((_, _, frames)) = &decoded {
+        if let Some((_, rate, frames)) = &decoded {
             let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
             self.levels[i] = self.levels[i].max(peak);
+            if kind == AudioKind::Mic
+                && let Some(h) = &mut self.mic_health
+            {
+                h.push(*rate, frames);
+            }
         }
         // Cut the buffer at pause boundaries (sample-accurate: AVAssetWriter
         // lays audio buffers end to end, so a dropped or overlapping piece
@@ -640,11 +814,17 @@ impl Sink {
         }
         let Some(o) = &self.out else { return };
         let input = match kind {
-            AudioKind::System => o.sys.as_ref(),
-            AudioKind::Mic => o.mic.as_ref(),
+            AudioKind::System => o.sys.clone(),
+            AudioKind::Mic => o.mic.clone(),
         };
-        let Some(input) = input else { return };
-        let input = input.clone();
+        // The camera file takes the same mic buffers, on the same timeline.
+        let iso_input = match kind {
+            AudioKind::Mic => self.cam_iso.as_ref().and_then(|c| c.out.mic.clone()),
+            AudioKind::System => None,
+        };
+        if input.is_none() && iso_input.is_none() {
+            return;
+        }
         // AVAssetWriter lays audio buffers end to end whatever their
         // timestamps say, so keep the track on the capture clock here: fill
         // a gap (late start, dropped device buffer) with silence and trim
@@ -684,14 +864,21 @@ impl Sink {
         self.audio_next[i] = Some(body_start + (i1 - i0) as f64 / rate);
         for b in bufs {
             unsafe {
-                if input.isReadyForMoreMediaData() && input.appendSampleBuffer(&b) {
-                    match kind {
-                        AudioKind::System => self.stats.audio_sys_buffers += 1,
-                        AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+                if let Some(input) = &input {
+                    if input.isReadyForMoreMediaData() && input.appendSampleBuffer(&b) {
+                        match kind {
+                            AudioKind::System => self.stats.audio_sys_buffers += 1,
+                            AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+                        }
+                    } else {
+                        self.stats.audio_drops += 1;
+                        self.check_writer();
                     }
-                } else {
-                    self.stats.audio_drops += 1;
-                    self.check_writer();
+                }
+                if let Some(iso) = &iso_input
+                    && !(iso.isReadyForMoreMediaData() && iso.appendSampleBuffer(&b))
+                {
+                    self.stats.camera_file_drops += 1;
                 }
             }
         }
@@ -762,10 +949,48 @@ impl Sink {
         }
     }
 
-    /// Emit every grid slot whose time is at or before `until` (host seconds).
+    /// Draw one output frame: the screen scaled to the output size and,
+    /// with a compositor, the scene. None if no output buffer was free.
     // `compositor.unwrap()` follows an `is_some` check because the output
     // buffer must be taken (borrowing self) before the compositor is borrowed.
     #[allow(clippy::unnecessary_unwrap)]
+    fn draw_frame(
+        &mut self,
+        mut screen: Option<CFRetained<CVPixelBuffer>>,
+        cam: Option<CFRetained<CVPixelBuffer>>,
+    ) -> Option<CFRetained<CVPixelBuffer>> {
+        // A native-size capture going through the compositor: scale it
+        // first (the compositor then draws it 1:1).
+        if let (Some(sc), Some(pool), Some(src)) = (self.scaler.as_mut(), &self.scaled_pool, screen.as_deref())
+            && sc.needed(src)
+        {
+            let mut buf = std::ptr::null_mut();
+            unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf)) };
+            if let Some(b) = std::ptr::NonNull::new(buf) {
+                let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(b) };
+                if sc.scale(src, &b) {
+                    screen = Some(b);
+                }
+            }
+        }
+        if self.compositor.is_some() {
+            let buf = self.new_output_buffer()?;
+            let scene = self.scene;
+            self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
+            Some(buf)
+        } else if self.scaled_pool.is_none()
+            && let Some(sc) = &self.scaler
+            && sc.needed(screen.as_deref()?)
+        {
+            let buf = self.new_output_buffer()?;
+            self.scaler.as_mut().unwrap().scale(screen.as_deref()?, &buf);
+            Some(buf)
+        } else {
+            screen
+        }
+    }
+
+    /// Emit every grid slot whose time is at or before `until` (host seconds).
     pub fn emit_until(&mut self, until: f64) {
         if self.t0.is_none() || self.failed.is_some() {
             return;
@@ -778,10 +1003,12 @@ impl Sink {
                 break;
             }
             // Encoder busy (e.g. a GPU load spike): retry this slot later
-            // unless it is already too far behind.
+            // unless it is already too far behind. The camera file's encoder
+            // counts too, so both files keep every frame and stay in step.
+            let ready = |o: &Out| unsafe { o.video.isReadyForMoreMediaData() };
             if self.pauses.offset_at(slot as f64).is_some()
                 && let Some(o) = &self.out
-                && !unsafe { o.video.isReadyForMoreMediaData() }
+                && !(ready(o) && self.cam_iso.as_ref().is_none_or(|c| ready(&c.out)))
                 && slot_t > until - MAX_BACKLOG_SECS
             {
                 self.stats.video_retries += 1;
@@ -803,21 +1030,7 @@ impl Sink {
                 continue;
             }
             let mut write = write;
-            let mut screen = self.screen_last.as_ref().map(|s| s.0.clone());
-            // A native-size capture going through the compositor: scale it
-            // first (the compositor then draws it 1:1).
-            if let (Some(sc), Some(pool), Some(src)) = (self.scaler.as_mut(), &self.scaled_pool, screen.as_deref())
-                && sc.needed(src)
-            {
-                let mut buf = std::ptr::null_mut();
-                unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, std::ptr::NonNull::from(&mut buf)) };
-                if let Some(b) = std::ptr::NonNull::new(buf) {
-                    let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(b) };
-                    if sc.scale(src, &b) {
-                        screen = Some(b);
-                    }
-                }
-            }
+            let screen = self.screen_last.as_ref().map(|s| s.0.clone());
             if screen.is_none() && self.scene != Scene::Cam {
                 continue;
             }
@@ -833,33 +1046,33 @@ impl Sink {
                     continue;
                 }
             }
-            let frame: CFRetained<CVPixelBuffer> = if self.compositor.is_some() {
-                let Some(buf) = self.new_output_buffer() else {
-                    if write {
-                        self.stats.video_drops += 1;
-                        self.out_slot += 1;
-                    }
-                    continue;
-                };
-                let cam = self.cam_last.as_ref().map(|b| b.0.clone());
-                let scene = self.scene;
-                self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
-                buf
-            } else if self.scaled_pool.is_none()
-                && let Some(sc) = &self.scaler
-                && sc.needed(screen.as_deref().unwrap())
-            {
-                let Some(buf) = self.new_output_buffer() else {
-                    if write {
-                        self.stats.video_drops += 1;
-                        self.out_slot += 1;
-                    }
-                    continue;
-                };
-                self.scaler.as_mut().unwrap().scale(screen.as_deref().unwrap(), &buf);
-                buf
-            } else {
-                screen.unwrap()
+            let cam = self.cam_last.as_ref().map(|b| b.0.clone());
+            // Nothing changed since the last frame: send it again. The screen
+            // only delivers frames when it changes and the camera usually
+            // runs at half the output rate, so most slots skip the redraw.
+            let key = FrameKey {
+                screen: screen.clone(),
+                cam: if self.scene.uses_cam() { cam.clone() } else { None },
+                scene: self.scene,
+                pip_gen: self.pip_gen,
+            };
+            let reused = self.last_frame.as_ref().filter(|(k, _)| k.same(&key)).map(|(_, f)| f.clone());
+            let frame = match reused {
+                Some(f) => {
+                    self.stats.frames_reused += 1;
+                    f
+                }
+                None => {
+                    let Some(f) = self.draw_frame(screen, cam) else {
+                        if write {
+                            self.stats.video_drops += 1;
+                            self.out_slot += 1;
+                        }
+                        continue;
+                    };
+                    self.last_frame = Some((key, f.clone()));
+                    f
+                }
             };
             if write {
                 let pts = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
@@ -876,6 +1089,18 @@ impl Sink {
                     }
                 } else {
                     self.stats.video_frames_out += 1;
+                }
+                if let Some(iso) = self.cam_iso.as_mut()
+                    && let Some(cam) = &self.cam_last
+                {
+                    if iso.append(&cam.0, pts) {
+                        self.stats.camera_file_frames += 1;
+                    } else {
+                        self.stats.camera_file_drops += 1;
+                        if std::env::var_os("REC_DEBUG").is_some() {
+                            eprintln!("rec: debug: camera file missed output slot {}", self.out_slot - 1);
+                        }
+                    }
                 }
             }
             if want_live && let Some(l) = &self.live {
@@ -911,7 +1136,14 @@ impl Sink {
         self.preview = None;
         self.emit_until(end);
         self.drain_mix(true);
+        self.stats.mic_summary = self.mic_summary();
         let end_t = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
+        // The camera file first; a failure there never loses the recording.
+        if let Some(iso) = &self.cam_iso
+            && let Err(e) = iso.finish(end_t)
+        {
+            eprintln!("rec: warning: {e:#}");
+        }
         let o = self.out.as_ref().unwrap();
         unsafe {
             o.writer.endSessionAtSourceTime(end_t);
@@ -934,7 +1166,9 @@ impl Sink {
     }
 }
 
-fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout: AudioLayout) -> Result<Out> {
+/// `clean_voice`: the mix track carries the cleaned-up voice, so it is
+/// written even with the mic alone (the mic stem stays the raw original).
+fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout: AudioLayout, clean_voice: bool) -> Result<Out> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
@@ -990,7 +1224,7 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
         };
         // Track order (documented in README): mix, system, mic.
         let both = system_audio && mic;
-        let want_mix = both && layout != AudioLayout::Stems;
+        let want_mix = (both || (mic && clean_voice)) && layout != AudioLayout::Stems;
         let want_stems = !both || layout != AudioLayout::Mix;
         let mix_input = if want_mix { Some(mk_audio(2, 256_000)?) } else { None };
         let sys = if system_audio && want_stems { Some(mk_audio(2, 256_000)?) } else { None };
@@ -1141,7 +1375,7 @@ mod tests {
                 let path = dir.join(format!("rec-probe-{name}.mov"));
                 let _ = std::fs::remove_file(&path);
                 let spec = super::VideoSpec { width: 320, height: 64, fps: 30, codec: crate::writer::Codec::H264, bitrate: 20_000_000, pixel_format: crate::util::PIX_BGRA };
-                let o = super::open_output(&path, &spec, false, false, super::AudioLayout::Both).unwrap();
+                let o = super::open_output(&path, &spec, false, false, super::AudioLayout::Both, false).unwrap();
                 o.writer.startSessionAtSourceTime(objc2_core_media::CMTime::new(0, 30));
                 let src = crate::compose::color_probe::stripes(320, 64, &vals, tag);
                 // Through the compositor as the camera (full frame) or as is.
@@ -1182,6 +1416,14 @@ mod tests {
     }
 
     use super::Pauses;
+
+    #[test]
+    fn camera_file_sits_next_to_the_recording() {
+        use std::path::Path;
+        let p = super::camera_path(Path::new("/m/rec-2026-10-21-101500.mov"));
+        assert_eq!(p, Path::new("/m/rec-2026-10-21-101500-camera.mov"));
+        assert_eq!(super::camera_path(Path::new("talk.mp4")), Path::new("talk-camera.mp4"));
+    }
 
     #[test]
     fn no_pauses_means_no_offset() {

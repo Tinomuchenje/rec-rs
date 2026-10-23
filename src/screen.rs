@@ -11,7 +11,10 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, kCGColorSpaceSRGB, kCGDisplayStreamYCbCrMatrix_ITU_R_709_2};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::CVPixelBuffer;
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSOperatingSystemVersion, NSProcessInfo,
+    NSString,
+};
 use objc2_screen_capture_kit::*;
 use dispatch2::DispatchQueue;
 
@@ -24,6 +27,12 @@ pub struct DisplayInfo {
     pub points: (i64, i64),
     pub pixels: (usize, usize),
     pub display: Retained<SCDisplay>,
+}
+
+/// ScreenCaptureKit microphone capture and click highlighting need macOS 15.
+pub fn sck_15_features() -> bool {
+    let v = NSOperatingSystemVersion { majorVersion: 15, minorVersion: 0, patchVersion: 0 };
+    NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(v)
 }
 
 fn shareable_content() -> Result<Retained<SCShareableContent>> {
@@ -43,7 +52,7 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
     match rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(c)) => Ok(c.0),
         Ok(Err(e)) => bail!(
-            "ScreenCaptureKit refused: {e}\n  -> grant Screen & System Audio Recording to Rec (see `rec permissions`)"
+            "ScreenCaptureKit refused: {e}\n  -> grant Screen & System Audio Recording to Tape (see `rec permissions`)"
         ),
         Err(_) => bail!("timed out waiting for ScreenCaptureKit shareable content"),
     }
@@ -265,7 +274,9 @@ impl ScreenCapture {
             conf.setPixelFormat(cfg.pixel_format);
             conf.setQueueDepth(8);
             conf.setShowsCursor(cfg.cursor);
-            conf.setShowMouseClicks(cfg.clicks);
+            if sck_15_features() {
+                conf.setShowMouseClicks(cfg.clicks);
+            }
             conf.setScalesToFit(true);
             conf.setPreservesAspectRatio(true);
             conf.setCaptureResolution(SCCaptureResolutionType::Best);

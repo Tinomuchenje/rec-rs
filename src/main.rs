@@ -14,6 +14,7 @@ mod settings;
 mod synth;
 mod tcc;
 mod util;
+mod voice;
 mod writer;
 
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ enum Cmd {
     /// Record the screen (plus system audio, mic, and optional webcam overlay).
     Record(RecordArgs),
     /// The app: window with live preview and sources, settings, menu bar
-    /// item and a global Cmd+Shift+R hotkey (what `open dist/Rec.app` starts).
+    /// item and a global Cmd+Shift+R hotkey (what `open dist/Tape.app` starts).
     Gui {
         /// Start recording immediately (e.g. from a Login Item or script).
         #[arg(long)]
@@ -61,7 +62,7 @@ enum Cmd {
     /// key from stdin; never echoed or logged).
     StreamKey {
         /// Stream URL (rtmp://, rtmps://, https://.../whip) or a service:
-        /// youtube, twitch.
+        /// youtube, twitch, kick.
         dest: String,
         /// Remove the stored key instead.
         #[arg(long)]
@@ -80,6 +81,9 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         wait: u64,
     },
+    /// Request Screen & System Audio Recording (run by `permissions --request`).
+    #[command(hide = true)]
+    RequestScreen,
     /// Check a recording with AVFoundation (the engine QuickTime uses).
     Probe { file: PathBuf },
     /// Play a file in an AVPlayer window (reference player for sync tests).
@@ -156,6 +160,17 @@ pub struct RecordArgs {
     /// Webcam overlay width as a fraction of the frame width.
     #[arg(long, default_value_t = 0.22)]
     pip_size: f64,
+    /// Webcam overlay height as a fraction of the frame height. Default:
+    /// the camera's aspect ratio, or square for circle, square and squircle.
+    #[arg(long)]
+    pip_height: Option<f64>,
+    /// Zoom the camera inside the overlay, 1 (fill it) to 4.
+    #[arg(long, default_value_t = 1.0)]
+    pip_zoom: f64,
+    /// Which part of the camera shows when zoomed or cropped: X,Y from 0
+    /// (left, top) to 1 (right, bottom), as seen.
+    #[arg(long, value_name = "X,Y", default_value = "0.5,0.5")]
+    pip_pan: String,
     /// Snap the webcam overlay to a corner.
     #[arg(long, value_enum, default_value_t = Corner::BottomRight)]
     pip_corner: Corner,
@@ -180,6 +195,23 @@ pub struct RecordArgs {
     /// Do not mirror the webcam.
     #[arg(long)]
     no_mirror: bool,
+    /// Presenter scene background color as hex RGB.
+    #[arg(long, default_value = "1e3a5f", value_name = "RRGGBB")]
+    bg_color: String,
+    /// Presenter scene background image (JPEG, PNG, HEIC...), covering the
+    /// frame over the background color.
+    #[arg(long, value_name = "FILE")]
+    bg_image: Option<std::path::PathBuf>,
+    /// Also save the camera on its own, full frame with the mic, as
+    /// NAME-camera.EXT next to the recording and in step with it frame for
+    /// frame (camera scenes other than --scene cam).
+    #[arg(long)]
+    save_camera: bool,
+    /// Clean up the voice in the mix track and streams: noise suppression
+    /// (RNNoise), automatic level and a gentle compressor. The mic stem stays
+    /// the raw original; with the mic alone a mix track is added for it.
+    #[arg(long)]
+    clean_voice: bool,
     /// Hide the mouse cursor.
     #[arg(long)]
     no_cursor: bool,
@@ -207,8 +239,9 @@ pub struct RecordArgs {
     #[arg(long, value_name = "SECS")]
     replay: Option<f64>,
     /// Stream to an RTMP(S) URL or a WHIP endpoint (http(s)://.../whip).
-    /// youtube and twitch are shortcuts. The key comes from
-    /// $REC_STREAM_KEY or the Keychain (`rec-rs stream-key URL`).
+    /// youtube, twitch and kick are shortcuts. Repeat it to stream to
+    /// several at once. The key comes from $REC_STREAM_KEY or the Keychain
+    /// (`rec-rs stream-key URL`).
     #[arg(long, value_name = "URL")]
     stream: Vec<String>,
     /// Do not write a recording file (replay buffer / streaming only).
@@ -219,7 +252,8 @@ pub struct RecordArgs {
     live_resolution: String,
     /// Live video bitrate in kb/s. Default: the platform's recommendation
     /// for the size and frame rate (YouTube 4K60 45 Mb/s H.264 or 35 HEVC,
-    /// Twitch at most 6 Mb/s), else YouTube's.
+    /// Twitch at most 6 Mb/s, Kick at most 8), else YouTube's. With several
+    /// destinations, the lowest of them.
     #[arg(long)]
     stream_bitrate: Option<u32>,
     /// Live video codec: auto (HEVC when every destination is YouTube),
@@ -405,6 +439,9 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         webcam,
         pip: PipSpec {
             size: a.pip_size.clamp(0.05, 0.9),
+            height: a.pip_height.map(|h| h.clamp(0.05, 1.0)),
+            zoom: a.pip_zoom.clamp(1.0, 4.0),
+            pan: parse_pos(&a.pip_pan)?.map(|v| v.clamp(0.0, 1.0)),
             place: match &a.pip_pos {
                 Some(p) => compose::Place::At(parse_pos(p)?),
                 None => compose::Place::Corner(a.pip_corner),
@@ -415,7 +452,11 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
             border_color: parse_hex(&a.pip_border_color)?,
             shadow: a.pip_shadow,
             mirror: !a.no_mirror,
+            bg_color: parse_hex(&a.bg_color)?,
+            bg_image: a.bg_image.clone(),
         },
+        save_camera: a.save_camera,
+        clean_voice: a.clean_voice,
         cursor: !a.no_cursor,
         clicks: a.clicks,
         duration: a.duration,
@@ -488,21 +529,9 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     if a.replay.is_some() || !a.stream.is_empty() {
         let live = live::Live::new();
         let (lw, lh) = live_box(&a.live_resolution)?;
-        let urls: Vec<String> = a.stream.iter().map(|d| live::destination_url(d)).collect();
-        let platforms: Vec<live::Platform> = urls.iter().map(|u| live::platform(u)).collect();
-        let want_hevc = match a.stream_codec.as_str() {
-            "hevc" => true,
-            "h264" => false,
-            _ => !platforms.is_empty() && platforms.iter().all(|p| *p == live::Platform::YouTube),
-        };
-        // Every destination's limits: the smallest bitrate and size, HEVC
-        // only if all of them take it.
-        let presets: Vec<(u32, usize, bool)> = if platforms.is_empty() { vec![live::preset(live::Platform::Other, lh.min(h), a.fps.min(60), want_hevc)] } else {
-            platforms.iter().map(|p| live::preset(*p, lh.min(h), a.fps.min(60), want_hevc)).collect()
-        };
-        let kbps = a.stream_bitrate.unwrap_or_else(|| presets.iter().map(|p| p.0).min().unwrap_or(6000));
-        let max_h = presets.iter().map(|p| p.1).min().unwrap_or(lh);
-        let hevc = presets.iter().all(|p| p.2);
+        let platforms: Vec<live::Platform> = a.stream.iter().map(|d| live::platform(&live::destination_url(d))).collect();
+        let (preset_kbps, max_h, hevc) = live::shared_preset(&platforms, lh.min(h), a.fps.min(60), &a.stream_codec);
+        let kbps = a.stream_bitrate.unwrap_or(preset_kbps);
         let (lw, lh) = if lh.min(h) > max_h { (max_h * 16 / 9, max_h) } else { (lw.min(w), lh.min(h)) };
         live.set_config(live::LiveConfig {
             width: lw,
@@ -576,13 +605,25 @@ fn record(a: RecordArgs) -> Result<()> {
             stats.audio_drops,
             stats.audio_clipped_samples
         );
+        if let Some(m) = &stats.mic_summary {
+            eprintln!("rec: mic: {m}");
+        }
+        if stats.camera_file_frames > 0 {
+            eprintln!(
+                "rec: saved {} (camera alone: {} video frames, {} dropped)",
+                writer::camera_path(&out).display(),
+                stats.camera_file_frames,
+                stats.camera_file_drops
+            );
+        }
     }
     if std::env::var_os("REC_DEBUG").is_some() {
         let avg = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 * 1000.0 };
         eprintln!(
-            "rec: debug: encoder busy retries {}, audio gaps filled {}",
+            "rec: debug: encoder busy retries {}, audio gaps filled {}, frames reused {}",
             stats.video_retries,
-            stats.audio_gaps_filled
+            stats.audio_gaps_filled,
+            stats.frames_reused
         );
         eprintln!(
             "rec: debug: frame arrival latency  screen avg {:.1} ms max {:.1} ms ({} frames)  camera avg {:.1} ms max {:.1} ms ({} frames)",
@@ -661,6 +702,10 @@ fn main() {
             println!("screen recording : {s}");
             println!("microphone       : {m}");
             println!("camera           : {c}");
+            Ok(())
+        }
+        Cmd::RequestScreen => {
+            tcc::request_screen_here();
             Ok(())
         }
         Cmd::Probe { file } => probe::probe(&file),
